@@ -20,8 +20,8 @@
 #define PT_CALL_REGION_SIZE 4096 * 4
 #define PT_CALL_REGION 0x000B0000
 
-#define PAGE_ALIGN(x) (x & ~(PAGE_SIZE - 1))
-#define PAGE_ALIGN_UP(x) (PAGE_ALIGN(x) + PAGE_SIZE) 
+#define _PAGE_ALIGN(x) (x & ~(4096 - 1))
+#define PAGE_ALIGN_UP(x) (_PAGE_ALIGN(x) + 4096) 
 #define PAGE_ROUND PAGE_ALIGN_UP
 #define ULONG_ROUND(x) ((x + sizeof(uint64_t) - 1) & ~(sizeof(uint64_t) - 1))
 

