@@ -65,7 +65,7 @@ saruman_ptrace_attach(struct saruman_ctx *ctx)
 	if (ctx->task.flags & PT_ATTACHED)
 		return true;
 
-	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
+	if (ptrace(PTRACE_ATTACH, ctx->task.pid, NULL, NULL) < 0) {
 		if (errno) {
 			fprintf(stderr, "PTRACE_ATTACH failed: %s\n", strerror(errno));
 			return false;
@@ -75,7 +75,7 @@ saruman_ptrace_attach(struct saruman_ctx *ctx)
 		/*
 		 * Wait for the child to STOP
 		 */
-		if (waitpid2(pid, &status, 0) < 0)
+		if (waitpid2(ctx->task.pid, &status, 0) < 0)
 			goto detach;
 
 		/*
@@ -96,12 +96,12 @@ saruman_ptrace_attach(struct saruman_ctx *ctx)
 		 * then resume the process with the original signal. We re-inject the signal
 		 * with WSTOPSIG(status)
 		 */
-		if (ptrace(PTRACE_CONT, pid, 0, WSTOPSIG(status)) == -1 )
+		if (ptrace(PTRACE_CONT, ctx->task.pid, 0, WSTOPSIG(status)) == -1 )
 			goto detach;
 	} while(1);
 
 	ctx->task.flags |= PT_ATTACHED;
-	saruman_debug("[+] PT_TID_ATTACHED -> %d\n", pid);
+	saruman_debug("[+] PT_TID_ATTACHED -> %d\n", ctx->task.pid);
 	return true;
 
 
@@ -110,7 +110,7 @@ detach:
 	 * Something went wrong
 	 */
 	fprintf(stderr, "Failed... detaching\n");
-	saruman_ptrace_detach(pid);
+	saruman_ptrace_detach(ctx->task.pid);
 	return false;
 }
 
