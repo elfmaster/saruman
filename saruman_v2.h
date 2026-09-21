@@ -21,3 +21,5 @@
 #include "shiva.h"
 
 #define __BREAKPOINT__ __asm__ __volatile__("int3");
+#define __RETURN_VALUE__(x) __asm__ __volatile__("mov %0, %%rax\n" :: "g"(x))
+
