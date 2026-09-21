@@ -17,7 +17,7 @@
 
 #define INIT_CODE_REGION 0x00C00000
 
-#define PT_CALL_REGION_SIZE 4096 * 10
+#define PT_CALL_REGION_SIZE 40960
 #define PT_CALL_REGION 0x000B0000
 
 #define STACK_SIZE PAGE_SIZE * 4096
@@ -54,6 +54,7 @@ typedef struct saruman_ctx {
 
 typedef struct saruman_rpc {
 	void * (*fn)(void);
+	size_t fn_len;
 	char **args;
 	int argc;
 	uint64_t retval;
@@ -81,7 +82,7 @@ typedef struct saruman_rpc {
 
 __PAYLOAD_KEYWORDS__ void * dlopen_loader(const char *path, uint64_t dlopen_addr)
 {
-	void * (*libc_dlopen)(const char *, int) = dlopen_addr;
+	void * (*libc_dlopen)(const char *, int) = (void *)dlopen_addr;
 	void *handle = (void *)0xfff; //initialized for debugging
 	handle = libc_dlopen(path, __RTLD_DLOPEN|RTLD_NOW|RTLD_GLOBAL);
 	__RETURN_VALUE__(handle);
@@ -520,6 +521,8 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 {
 	bool res;
 	uint64_t addr;
+	struct user_regs_struct *pt_regs = &ctx->pt_regs;
+	int status;
 
 	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &ctx->pt_regs) < 0) {
 		perror("ptrace");
@@ -529,7 +532,7 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 	addr = ctx->bootstrap_phase_complete ?
 	    PT_CALL_REGION : ctx->bootstrap.executable_base_addr;
 
-	res = saruman_ptrace_write(ctx, addr, rpc->fn, rpc->fn_len);
+	res = saruman_ptrace_write(ctx, (void *)addr, rpc->fn, rpc->fn_len);
 	if (res == false) {
 		fprintf(stderr, "saruman_ptrace_write() failed on pid %d\n", ctx->task.pid);
 		return false;
@@ -538,48 +541,48 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 	ctx->pt_regs.rip = ctx->bootstrap.executable_base_addr;
 	switch(rpc->argc) {
 	case 1:
-		pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
 		break;
 	case 2:
-		pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-		pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
 		break;
 	case 3:
-		pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-		pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-		pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
 		break;
 	case 4:
-		pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-		pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-		pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
-		pt_reg->rcx = (uintptr_t)h->payloads.function[func].args[3];
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
+		pt_regs->rcx = (uintptr_t)rpc->args[3];
 		break;
 	case 5:
-		pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-		pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-		pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
-		pt_reg->rcx = (uintptr_t)h->payloads.function[func].args[3];
-		pt_reg->r8 =  (uintptr_t)h->payloads.function[func].args[4];
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
+		pt_regs->rcx = (uintptr_t)rpc->args[3];
+		pt_regs->r8 =  (uintptr_t)rpc->args[4];
 		break;
 	case 6:
-		pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-		pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-		pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
-		pt_reg->rcx = (uintptr_t)h->payloads.function[func].args[3];
-		pt_reg->r8 =  (uintptr_t)h->payloads.function[func].args[4];
-		pt_reg->r9 =  (uintptr_t)h->payloads.function[func].args[5];
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
+		pt_regs->rcx = (uintptr_t)rpc->args[3];
+		pt_regs->r8 =  (uintptr_t)rpc->args[4];
+		pt_regs->r9 =  (uintptr_t)rpc->args[5];
 		break;
 	}
-	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &ctx->pt_reg) < 0) {
+	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &ctx->pt_regs) < 0) {
 		perror("ptrace setregs");
 		return false;
 	}
-	if (ptrace(PTRACE_CONT, h->tasks.pid, NULL, NULL) < 0) {
+	if (ptrace(PTRACE_CONT, ctx->task.pid, NULL, NULL) < 0) {
 		perror("ptrace cont");
 		return false;
 	}
-	waitpid2(h->tasks.pid, &status, 0);
+	waitpid2(ctx->task.pid, &status, 0);
 
 	if (WSTOPSIG(status) != SIGTRAP) {
 		fprintf(stderr,
@@ -588,11 +591,11 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 		return false;
 	}
 	/* Get return value */
-	if (ptrace(PTRACE_GETREGS, h->tasks.pid, NULL, pt_reg) < 0) {
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, pt_regs) < 0) {
 		perror("PTRACE_GETREGS");
 		return -1;
 	}
-	rpc->retval = ctx->pt_reg->rax;
+	rpc->retval = pt_regs->rax;
 	return true;
 }
 
@@ -604,8 +607,8 @@ bool saruman_run_boostrap(struct saruman_ctx *ctx)
 	saruman_debug("Writing %zu bytes of bootstrap code into %p\n",
 	    len, (void *)ctx->bootstrap.executable_base_addr);
 
-	char *argv[] = {PT_CALL_REGION, PT_CALL_REGION_SIZE, 0x0};
-	saruman_remote_call_init(&rpc, &bootstrap_code, argv, 3);
+	char *argv[] = {(void *)PT_CALL_REGION, (void *)PT_CALL_REGION_SIZE, (void *)0x0};
+	saruman_remote_call_init(&rpc, &bootstrap_code, sizeof(bootstrap_code), argv, 3);
 	if (saruman_remote_call(ctx, &rpc) == false) {
 		fprintf(stderr, "saruman_remote_call() failed on: run_bootstrap()\n");
 		return false;
@@ -614,9 +617,16 @@ bool saruman_run_boostrap(struct saruman_ctx *ctx)
 	return true;
 }
 
+bool saruman_find_libc_dlopen(struct saruman_ctx *ctx)
+{
+
+
+}
+
 int main(int argc, char **argv)
 {
 	struct saruman_ctx saruman;
+	struct saruman_rpc rpc;
 
 	memset(&saruman, 0, sizeof(saruman));
 
@@ -666,7 +676,7 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	char *dlopen_loader_args[] = {argv[2], dlopen_addr};
+	char *dlopen_loader_args[] = {argv[2], (char *)dlopen_addr};
 	saruman_remote_call_init(&rpc, &dlopen_loader, sizeof(dlopen_loader),
 	    dlopen_loader_args, 2);
 	saruman_remote_call(&saruman, &rpc);
