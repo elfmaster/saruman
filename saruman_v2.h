@@ -20,3 +20,4 @@
 #include "libelfmaster.h"
 #include "shiva.h"
 
+#define __BREAKPOINT__ __asm__ __volatile__("int3");
