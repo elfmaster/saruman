@@ -102,8 +102,16 @@ __PAYLOAD_KEYWORDS__ void * dlopen_loader(const char *path, uint64_t dlopen_addr
 {
 	void * (*libc_dlopen)(const char *, int) = (void *)((uint64_t)dlopen_addr);
 	void *handle = (void *)0xfff; //initialized for debugging
-	handle = libc_dlopen(path, __RTLD_DLOPEN|RTLD_NOW|RTLD_GLOBAL);
+	handle = libc_dlopen(path, RTLD_NOW|RTLD_GLOBAL);
 	__RETURN_VALUE__(handle);
+	__BREAKPOINT__;
+}
+
+__PAYLOAD_KEYWORDS__ void * dlerror2(uint64_t dlerror_addr)
+{
+	void * (*libc_dlerror)(void) = (void *)((uint64_t)dlerror_addr);
+       char *str = libc_dlerror();
+	__RETURN_VALUE__(str);
 	__BREAKPOINT__;
 }
 
@@ -514,13 +522,13 @@ bool saruman_backup_cave(struct saruman_ctx *ctx, uint64_t cave_addr,
 }
 
 bool saruman_restore_cave(struct saruman_ctx *ctx)
-{               
-        if (saruman_ptrace_write(ctx, (void *)ctx->orig_code_cave_addr,
+{		
+	if (saruman_ptrace_write(ctx, (void *)ctx->orig_code_cave_addr,
 	    ctx->orig_code_cave, ctx->cave_len) == false) {
-                fprintf(stderr, "saruman_ptrace_write() failed on %#lx\n", ctx->orig_code_cave_addr);
-                return false;
-        }       
-        return true;    
+		fprintf(stderr, "saruman_ptrace_write() failed on %#lx\n", ctx->orig_code_cave_addr);
+		return false;
+	}	
+	return true;	
 }
 
 bool saruman_find_bootloader_cave(struct saruman_ctx *ctx)
@@ -717,7 +725,7 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 		int i;
 		char tmp[32];
 		saruman_ptrace_read(ctx, tmp, rpc->args[0], 16);
-		saruman_debug("tmp: %s\n", tmp);
+		saruman_debug("tmp: %s tmp is %d bytes\n", tmp, strlen(tmp));
 		saruman_debug("dlopen addr: %p\n", rpc->args[1]);
 		saruman_ptrace_read(ctx, tmp, rpc->args[1], 16);
 		for (i = 0; i < 16; i++)
@@ -837,11 +845,37 @@ bool saruman_find_libc_dlopen(struct saruman_ctx *ctx, uint64_t *value)
 	return true;
 }
 
+bool saruman_find_libc_dlerror(struct saruman_ctx *ctx, uint64_t *value)
+{
+	elf_error_t elf_error;
+	struct elf_symbol symbol;
+
+	if (ctx->libc.elfobj == NULL) {
+		ctx->libc.elfobj = malloc(sizeof(elfobj_t));
+		if (ctx->libc.elfobj == NULL) {
+			perror("malloc");
+			return false;
+		}
+		if (elf_open_object(LIBC_PATH, ctx->libc.elfobj,
+		    ELF_LOAD_F_STRICT, &elf_error) == false) {
+			fprintf(stderr, "elf_open_object() failed on %s: %s\n",
+			    LIBC_PATH, elf_error_msg(&elf_error));
+			return false;
+		}
+	}
+	if (elf_symbol_by_name(ctx->libc.elfobj, "dlerror", &symbol) == false) {
+		fprintf(stderr, "elf_symbol_by_name() failed on: \"dlerror\"\n");
+		return false;
+	}
+	symbol.value += ctx->libc_base_vaddr;
+	memcpy(value, &symbol.value, sizeof(uint64_t));
+}
+
 int main(int argc, char **argv)
 {
 	struct saruman_ctx saruman;
 	struct saruman_rpc rpc;
-	uint64_t retval, dlopen_addr;
+	uint64_t retval, dlopen_addr, dlerror_addr;
 	bool res;
 	int i;
 
@@ -935,7 +969,30 @@ int main(int argc, char **argv)
 
 	printf("Handle: %p\n", (void *)rpc.retval);
 	printf("Successfully injected executable '%s' into memory\n", argv[2]);
-	
+
+	/*
+	 * If debug is on then call dlerror to see why dlopen is failing
+	 */
+#if DEBUG
+	if ((void *)rpc.retval == NULL) {
+		res = saruman_find_libc_dlerror(&saruman, &dlerror_addr);
+
+		char *dlerror_loader_args[] = {(char *)dlerror_addr};
+		saruman_remote_call_init(&rpc, &dlerror2, 1024, dlerror_loader_args, 1);
+		saruman_remote_call(&saruman, &rpc);
+
+		saruman_debug("Reading from rpc.retval: %p\n", (void *)rpc.retval);
+		char tmp[32];
+
+		if (saruman_ptrace_read(&saruman, tmp, (void *)rpc.retval, 32) == false) {
+			fprintf(stderr, "saruman_ptrace_read() failed\n");
+			exit(EXIT_FAILURE);
+		}
+		if (rpc.retval != 0)
+			saruman_debug("dlerror msg: %s\n", tmp);
+	}
+#endif
+
 	if (saruman_restore_cave(&saruman) == false) {
 		fprintf(stderr, "Failed restoring code cave in text region of main executable\n");
 		exit(EXIT_FAILURE);
