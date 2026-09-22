@@ -923,7 +923,7 @@ int main(int argc, char **argv)
 
 	printf("Calling dlopen_loader remotely, dlopen() is at %p\n", (void *)dlopen_addr);
 	/*
-	 * Push the string onto the remote process stack that we initialized
+	 * Push the pathname string onto the remote process stack that we initialized
 	 * in the bootstrap code. This is necessary for injected code to access
 	 * memory.
 	 */
