@@ -61,6 +61,9 @@ typedef struct saruman_ctx {
 		uint64_t executable_base_addr;
 		size_t executable_len;
 	} bootstrap;
+	struct {
+		uint64_t entry_point;
+	} parasite;
 	bool bootstrap_phase_complete;
 } saruman_ctx_t;
 
@@ -725,7 +728,7 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 		int i;
 		char tmp[32];
 		saruman_ptrace_read(ctx, tmp, rpc->args[0], 16);
-		saruman_debug("tmp: %s tmp is %d bytes\n", tmp, strlen(tmp));
+		saruman_debug("tmp: %s tmp is %zu bytes\n", tmp, strlen(tmp));
 		saruman_debug("dlopen addr: %p\n", rpc->args[1]);
 		saruman_ptrace_read(ctx, tmp, rpc->args[1], 16);
 		for (i = 0; i < 16; i++)
@@ -871,6 +874,51 @@ bool saruman_find_libc_dlerror(struct saruman_ctx *ctx, uint64_t *value)
 	memcpy(value, &symbol.value, sizeof(uint64_t));
 }
 
+bool saruman_remove_pie_flag(struct saruman_ctx *ctx)
+{
+	elf_dynamic_entry_t d_entry;
+	elf_dynamic_iterator_t d_iter;
+	elf_error_t error;
+	bool res;
+
+	if (ctx->elfobj == NULL) {
+		ctx->elfobj = malloc(sizeof(elfobj_t));
+		if (ctx->elfobj == NULL) {
+			perror("malloc");
+			return false;
+		}
+		if (elf_open_object(ctx->exec_path, ctx->elfobj,
+		    ELF_LOAD_F_STRICT|ELF_LOAD_F_MODIFY, &error) == false) {
+			fprintf(stderr, "elf_open_object() failed on %s: %s\n",
+			    ctx->exec_path, elf_error_msg(&error));
+			return false;
+		}
+	}
+
+	printf("Initializing elf_dynamic_iterator_init\n");
+	elf_dynamic_iterator_init(ctx->elfobj, &d_iter);
+	for (;;) {
+		printf("Calling iterator\n");
+		res = elf_dynamic_iterator_next(&d_iter, &d_entry);
+		if (res == ELF_ITER_DONE)
+			break;
+		if (res == ELF_ITER_ERROR) {
+			fprintf(stderr, "elf_dynamic_iterator_next failed\n");
+			return false;
+		}
+		printf("tag value: %d\n", d_entry.tag);
+		if (d_entry.tag == DT_FLAGS_1) {
+			uint64_t tval = d_entry.value & ~(uint64_t)DF_1_PIE;
+			if (elf_dynamic_set_value(&d_iter, tval) == false) {
+				fprintf(stderr, "Failed to remove DF_1_PIE flag from binary\n");
+				return false;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 int main(int argc, char **argv)
 {
 	struct saruman_ctx saruman;
@@ -899,6 +947,11 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 	
+	if (saruman_remove_pie_flag(&saruman) == false) {
+		fprintf(stderr, "failed to remove DT_FLAG_1 PIE flag\n");
+		exit(EXIT_FAILURE);
+	}
+
 	fprintf(stdout, "Attaching to PID: %d\n", saruman.task.pid);
 	fprintf(stdout, "Injecting: %s\n", saruman.exec_path);
 
@@ -962,12 +1015,18 @@ int main(int argc, char **argv)
 	 * memory.
 	 */
 	char *exec_path = (char *)saruman_push_string(&saruman, argv[2]);
+
+	/*
+	 * Setup RPC args to call dlopen_loader(path, dlopen_vaddr);
+	 */
 	char *dlopen_loader_args[] = {exec_path, (char *)dlopen_addr};
 	saruman_remote_call_init(&rpc, &dlopen_loader, 1024,
 	    dlopen_loader_args, 2);
 	saruman_remote_call(&saruman, &rpc);
-
-	printf("Handle: %p\n", (void *)rpc.retval);
+	printf("Entry point before base: %lx\n", elf_entry_point(saruman.elfobj));
+	saruman.parasite.entry_point = rpc.retval + elf_entry_point(saruman.elfobj);
+	
+	saruman_debug("Handle: %p\n", (void *)rpc.retval);
 	printf("Successfully injected executable '%s' into memory\n", argv[2]);
 
 	/*
@@ -992,6 +1051,17 @@ int main(int argc, char **argv)
 			saruman_debug("dlerror msg: %s\n", tmp);
 	}
 #endif
+
+	printf("Calling create_thread(%p, NULL, %#lx)\n",
+	    (char *)saruman.parasite.entry_point, saruman.stack.rsp);
+
+	char *pthread_args[] = {(char *)saruman.parasite.entry_point, NULL, (char *)saruman.stack.rsp};
+
+	saruman_remote_call_init(&rpc, &create_thread, 1024, pthread_args, 3);
+	if (saruman_remote_call(&saruman, &rpc) == false) {
+		fprintf(stderr, "saruman_remote_call() failed on a remote call to create_thread()\n");
+		exit(EXIT_FAILURE);
+	}
 
 	if (saruman_restore_cave(&saruman) == false) {
 		fprintf(stderr, "Failed restoring code cave in text region of main executable\n");
