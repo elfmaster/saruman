@@ -203,7 +203,7 @@ __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned 
 		:"=a" (retval)
 		:"0" (__NR_clone),"i" (__NR_exit),
 		 "g" (fn),
-		 "D" (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | SIGCHLD),
+		 "D" (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | SIGCHLD), // | CLONE_THREAD | CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID),
 		 "S" (newstack));
 
 	if (retval < 0) {
@@ -881,6 +881,7 @@ int main(int argc, char **argv)
 	struct saruman_ctx saruman;
 	struct saruman_rpc rpc;
 	uint64_t retval, dlopen_addr, dlerror_addr;
+	struct elf_symbol symbol;
 	bool res;
 	int i;
 
@@ -988,8 +989,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Failed to find base address of injected: %s\n", argv[2]);
 		exit(EXIT_FAILURE);
 	}
-	saruman.parasite.entry_point = saruman.parasite.base_vaddr + elf_entry_point(saruman.elfobj);
-	printf("Entry point of parasite: %#lx\n", saruman.parasite.entry_point);
+	
+	if (elf_symbol_by_name(saruman.elfobj, "main", &symbol) == false) {
+		fprintf(stderr, "elf_symbol_by_name() failed on main\n");
+		exit(EXIT_FAILURE);
+	}
+	saruman.parasite.entry_point = saruman.parasite.base_vaddr + symbol.value; //elf_entry_point(saruman.elfobj);
+	printf("Entry point of parasite main(): %#lx\n", saruman.parasite.entry_point);
 
 	/*
 	 * If debug is on then call dlerror to see why dlopen is failing
@@ -1024,15 +1030,21 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
+	printf("Restoring code cave of host executable\n");
+
 	if (saruman_restore_cave(&saruman) == false) {
 		fprintf(stderr, "Failed restoring code cave in text region of main executable\n");
 		exit(EXIT_FAILURE);
 	}
 
+	printf("Restoring register state of host executable\n");
+
 	if (saruman_restore_register_state(&saruman) == false) {
 		fprintf(stderr, "Failed to restore register state with PTRACE\n");
 		exit(EXIT_FAILURE);
 	}
+
+	printf("Detaching from %d\n", saruman.task.pid);
 
 	if (saruman_ptrace_detach(&saruman) == false) {
 		fprintf(stderr, "saruman_ptrace_detach() failed on %d\n", saruman.task.pid);
