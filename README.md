@@ -1,15 +1,36 @@
-Saruman v0.1 (Ryan O'Neill) elfmaster@zoho.com
+# saruman_v2
 
-Type make to compile launcher (It will also try to compile a parasite.c file which
-is for you too supply). Make sure your parasite executable is compiled -fpic -pie
+## Description
 
-./launcher <pid> <parasite_executable> <parasite_args, [arg1, arg2, argN]> 
+Saruman injects a dynamically linked PIE executable into a remote process image and creates
+a thread of execution for it. This is an anti-forensics technique. Further improvements can be made
+such as writing a custom loader to replace dlopen that specifically uses anonymous memory mappings.
 
-NOTE: In this version Saruman doesn't yet support injecting a program that requires command line args
-because it is early POC. So <parasite_args> will not actually accept args yet.
+## Build instructions
 
-./launcher --no-dlopen <pid> <parasite_executable>
+### Install libelfmaster
 
-When using --no-dlopen it uses a more stealth technique of loading the executable
-so that it doesn't show up as /path/to/parasite.exe in the /proc maps file.
-Currently this has some bugs and won't work with more complex parasites (To be fixed)
+```
+$ git clone git@github.com:elfmaster/libelfmaster
+$ cd libelfmaster/src
+$ make
+$ sudo make install
+```
+
+### Build Saruman
+
+```
+$ cd saruman
+$ make
+```
+
+### Usage
+
+Specify the target pid of the process you want to inject into
+Specify the path of the executable you want to run inside of the remote process
+Specify the command line args of the program you are injecting
+```
+./saruman <target_pid> <exec_path> [args]
+```
+
+

