@@ -195,7 +195,7 @@ __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data,
 		: "=a"(retval)
 		: "0"((long)__NR_clone),
 		  "D"((long)(CLONE_VM | CLONE_FS | CLONE_FILES |
-			     CLONE_SIGHAND | SIGCHLD)),
+			     CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM )), /*SIGCHLD)), */
 		  "S"(newstack),
 		  [fn] "r"(fn),
 		  [argc] "r"((long)main_argc),
