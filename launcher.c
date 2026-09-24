@@ -168,52 +168,6 @@ __PAYLOAD_KEYWORDS__ void * evil_mmap(void *addr, unsigned long len, unsigned lo
 	return (void *)ret;
 }
 
-#if 0
-__PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data,
-    unsigned long stack, int main_argc, char **main_argv)
-{
-	long retval;
-	void **newstack = (void **)stack;
-	*--newstack = data;
-
-	__asm__ __volatile__(
-		"xor %%rdx, %%rdx\n\t"
-		"xor %%r10, %%r10\n\t"
-		"xor %%r8,  %%r8\n\t"
-		"syscall\n\t"
-		"test %%rax, %%rax\n\t"
-		"jne 1f\n\t"
-
-		"mov %[argc], %%rdi\n\t"
-		"mov %[argv], %%rsi\n\t"
-		"xor %%rdx, %%rdx\n\t"
-		"call *%[fn]\n\t"
-
-		"xor %%rdi, %%rdi\n\t"
-		"mov %[exitnr], %%eax\n\t"
-		"syscall\n"
-		"1:\n"
-		: "=a"(retval)
-		: "0"((long)__NR_clone),
-		  "D"((long)(CLONE_VM | CLONE_FS | CLONE_FILES |
-			     CLONE_SIGHAND | SIGCHLD)),
-		  "S"(newstack),
-		  [fn] "r"(fn),
-		  [argc] "r"((long)main_argc),
-		  [argv] "r"(main_argv),
-		  [exitnr] "i"(__NR_exit)
-		: "rcx", "r11", "rdx", "r10", "r8", "memory"
-	);
-
-	if (retval < 0) {
-		retval = -1;
-		__RETURN_VALUE__(retval);
-	}
-	__BREAKPOINT__;
-	return (int)retval;
-}
-#endif
-
 __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data,
     unsigned long stack, int main_argc, char **main_argv)
 {
@@ -257,43 +211,6 @@ __PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data,
 	__BREAKPOINT__;
 	return (int)retval;
 }
-
-#if 0
-
-__PAYLOAD_KEYWORDS__ int create_thread(void (*fn)(void *), void *data,
-    unsigned long stack)
-{
-	long retval;
-	void **newstack;
-
-	newstack = (void **)stack;
-	*--newstack = data;
-
-	__asm__ __volatile__(
-		"syscall	\n\t"
-		"test %0,%0	\n\t"
-		"jne 1f		\n\t"
-		"call *%3	\n\t"
-		"mov %2,%0	\n\t"
-		"xor %%r10, %%r10\n\t"
-		"xor %%r8, %%r8\n\t"
-		"xor %%r9, %%r9 \n\t"
-		"int $0x80	\n\t"
-		"1:\t"
-		:"=a" (retval)
-		:"0" (__NR_clone),"i" (__NR_exit),
-		 "g" (fn),
-		 "D" (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | SIGCHLD),
-		 "S" (newstack));
-
-	if (retval < 0) {
-		retval = -1;
-		__RETURN_VALUE__(retval);
-	}
-	__BREAKPOINT__;
-}
-
-#endif
 
 __PAYLOAD_KEYWORDS__ uint64_t bootstrap_code(void * vaddr, uint64_t size, void *stack)
 {
