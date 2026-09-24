@@ -1,3 +1,8 @@
+/*
+ * Saruman Version 2.0
+ * elfmaster [at] arcana-research.io
+ */
+
 #include <sys/user.h>
 #include <sys/ptrace.h>
 #include <ctype.h>
@@ -682,7 +687,7 @@ bool saruman_remote_call(struct saruman_ctx *ctx, struct saruman_rpc *rpc)
 		saruman_debug("pt_regs->rsp is set to %#llx\n", pt_regs->rsp);
 	}
 
-	saruman_debug("rdi: %#lx rsi %#lx rdx %#lx rcx %#lx r8 %#lx\n",
+	saruman_debug("rdi: %p rsi %p rdx %p rcx %p r8 %p\n",
 			rpc->args[0],rpc->args[1],rpc->args[2],rpc->args[3],rpc->args[4]);
 	switch(rpc->argc) {
 	case 1:
@@ -1071,6 +1076,7 @@ int main(int argc, char **argv)
 	if ((void *)rpc.retval == NULL) {
 		res = saruman_find_libc_dlerror(&saruman, &dlerror_addr);
 
+		saruman_debug("Calling a remote dlerror()\n");
 		char *dlerror_loader_args[] = {(char *)dlerror_addr};
 		saruman_remote_call_init(&rpc, &dlerror2, 1024, dlerror_loader_args, 1);
 		saruman_remote_call(&saruman, &rpc);
@@ -1091,38 +1097,6 @@ int main(int argc, char **argv)
 	 * A remote call to creat_thread() will begin execution at main() but we need to have
 	 * the char **argv ascii data stored into remote stack memory before-hand.
 	 */
-#if 0
-	for (i = 0; i < argc - 1; i++) {
-		printf("Pushing: %s\n", argv[i + 2]);
-		saruman.parasite.main_argv[i] = (char *)saruman_push_string(&saruman, argv[i + 2]);
-		printf("saruman.parasite.main_argv[%d] = %p\n", i, saruman.parasite.main_argv[i]);
-		if (i >= MAX_ARGV_LEN) {
-			fprintf(stderr, "Too many argv entries to main()\n");
-			exit(EXIT_FAILURE);
-		}
-	}
-	saruman.parasite.main_argv[i] = NULL;
-	saruman.parasite.main_argc = argc - 1;
-	main_argc = saruman.parasite.main_argc;
-	main_argv = saruman.parasite.main_argv;
-
-	printf("main_argv[1]: %p\n", main_argv[0]);
-	printf("main_argv[2]: %p\n", main_argv[1]);
-
-	printf("Calling create_thread(%p, NULL, %#lx)\n",
-	    (char *)saruman.parasite.entry_point, saruman.stack.rsp);
-
-	printf("main_argc: %d\n", main_argc);
-
-	char *pthread_args[] = {(char *)saruman.parasite.entry_point, NULL, (char *)saruman.stack.rsp,
-				(char *)(uint64_t)main_argc, (char *)main_argv};
-
-	saruman_remote_call_init(&rpc, &create_thread, 1024, pthread_args, 5);
-	if (saruman_remote_call(&saruman, &rpc) == false) {
-		fprintf(stderr, "saruman_remote_call() failed on a remote call to create_thread()\n");
-		exit(EXIT_FAILURE);
-	}
-#endif
 	for (i = 0; i < argc - 1; i++) {
 		if (i >= MAX_ARGV_LEN) {
 			fprintf(stderr, "Too many argv entries to main()\n");
@@ -1159,6 +1133,9 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	    }
 	}
+	/*
+	 * Write terminating NULL to and of argv array
+	 * */
 	if (!saruman_ptrace_write(&saruman,
 	    (void *)(remote_argv +
 		(uint64_t)saruman.parasite.main_argc * 8),
@@ -1217,5 +1194,3 @@ int main(int argc, char **argv)
 
 	exit(0);
 }
-
-
