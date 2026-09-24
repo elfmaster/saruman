@@ -1025,7 +1025,7 @@ int main(int argc, char **argv)
 		saruman_debug("saruman.parasite.main_argv[%d] = %p\n",
 		    i, saruman.parasite.main_argv[i]);
 	}
-    	saruman.parasite.main_argc = argc - 1;
+	saruman.parasite.main_argc = argc - 1;
 
 	/*
 	 * Copy char **argv array of pointers to remote stack
@@ -1042,13 +1042,14 @@ int main(int argc, char **argv)
 	 * Write argv[0 ... N] to remote stack.
 	 */
 	for (i = 0; i < saruman.parasite.main_argc; i++) {
-	    uint64_t p = (uint64_t)saruman.parasite.main_argv[i];
-	    if (!saruman_ptrace_write(&saruman,
-		(void *)(remote_argv + (uint64_t)i * 8),
-		&p, sizeof(p))) {
-		fprintf(stderr, "failed to write argv[%d]\n", i);
-		exit(EXIT_FAILURE);
-	    }
+		uint64_t p = (uint64_t)saruman.parasite.main_argv[i];
+
+		if (!saruman_ptrace_write(&saruman,
+		    (void *)(remote_argv + (uint64_t)i * 8),
+		    &p, sizeof(p))) {
+			fprintf(stderr, "failed to write argv[%d]\n", i);
+			exit(EXIT_FAILURE);
+		}
 	}
 	/*
 	 * Write terminating NULL to and of argv array
@@ -1057,8 +1058,8 @@ int main(int argc, char **argv)
 	    (void *)(remote_argv +
 		(uint64_t)saruman.parasite.main_argc * 8),
 	    &z, sizeof(z))) {
-	    fprintf(stderr, "failed to write argv NULL\n");
-	    exit(EXIT_FAILURE);
+		fprintf(stderr, "failed to write argv NULL\n");
+		exit(EXIT_FAILURE);
 	}
 
 	saruman_debug("remote argv @ %#lx argc=%d\n",
@@ -1083,9 +1084,9 @@ int main(int argc, char **argv)
 	    remote_argv);
 
 	if (saruman_remote_call(&saruman, &rpc) == false) {
-	    fprintf(stderr,
-		"saruman_remote_call() failed on create_thread()\n");
-	    exit(EXIT_FAILURE);
+		fprintf(stderr,
+		    "saruman_remote_call() failed on create_thread()\n");
+		exit(EXIT_FAILURE);
 	}
 
 	printf("Restoring code cave of host executable\n");
