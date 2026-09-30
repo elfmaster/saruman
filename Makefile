@@ -1,11 +1,12 @@
-all: main testprog host
+all: main backdoor host
 main:
 	gcc -D_GNU_SOURCE -fno-stack-protector -I/opt/elfmaster/include -O0 launcher.c /opt/elfmaster/lib/libelfmaster.a  \
 	       	-o saruman
-testprog:
-	gcc -g -pie -o test test.c -Wl,-E
+backdoor:
+	gcc backdoor.c -o backdoor
+
 host:
 	gcc host.c -o host
 
 clean:
-	rm -f saruman test host
+	rm -f saruman host backdoor
